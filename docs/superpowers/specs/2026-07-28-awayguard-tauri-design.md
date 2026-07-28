@@ -44,6 +44,29 @@ returns a valid RSSI; `openConnection()` against an iPhone fails with `kIOReturn
 - The RF environment is crowded: **251 BLE devices** in a single scan. Filtering must be by stored
   UUID, never by name.
 
+### Correction: RSSI alone cannot detect departure
+
+The walk test above confirmed RSSI is live **while the phone is advertising**. It did not test
+abrupt signal loss, and that is where the naive design fails.
+
+Reading btleplug 0.12.0's CoreBluetooth backend showed that `Adapter::peripherals()` never evicts
+a scanned peripheral — the only removal (`corebluetooth/internal.rs:815`) fires on GATT
+`DeviceDisconnected`, and AwayGuard only scans, never connects. `PeripheralProperties::rssi` is
+initialized `None` (`peripheral.rs:104`) and thereafter only ever assigned on an advertisement
+(`:145, :156, :166`); it is never reset.
+
+So once the phone has been discovered, reading `rssi` returns the **last-heard value forever**.
+That is the same frozen-cache defect that disqualified classic Bluetooth, one layer down. The
+gradual walk-away only worked by luck: a final advertisement below the away threshold arrived
+before advertisements stopped. Abrupt loss — elevator, fire door, Bluetooth off, dead battery —
+would leave the app reporting "near, armed, healthy" indefinitely.
+
+**Departure is therefore detected by a liveness clock, not by signal strength.** An
+advertisement-event-driven task records a monotonic last-seen timestamp for the target, and
+`sample()` reports `Ok(None)` once that timestamp is older than a 10-second staleness window
+(five missed 2-second polls). RSSI still drives the Near/Away thresholds; staleness is what makes
+"gone" observable at all.
+
 The noise is the central design constraint. A single threshold comparison would flap and fire
 spurious locks. Departure detection therefore requires smoothing, dual-threshold hysteresis, and
 consecutive-sample confirmation.
@@ -77,9 +100,18 @@ Transitions use dual thresholds that do not overlap:
   `confirm_samples` consecutive rounds.
 - `Away -> Near` requires smoothed RSSI above `near_threshold` (higher than `away_threshold`).
 
-The gap between thresholds is the hysteresis band that prevents oscillation at the boundary. After
-`Away` is confirmed, a configurable grace period elapses before the lock fires, so briefly stepping
-out of range does not lock the machine.
+The gap between thresholds is the hysteresis band that prevents oscillation at the boundary. It is
+floored at 12 dB — a narrower band against the measured ~20 dB spread would make every poll
+conclusive and lock the screen at the desk.
+
+A lock fires only on departure from a **confirmed `Near`** state. `Unknown -> Away` must not lock:
+at launch the tracker is `Unknown` and the scan cache is empty, so treating that as a departure
+would lock the screen within seconds of login whenever the phone was not yet discovered.
+
+After `Away` is confirmed, a configurable grace period elapses before the lock fires, so briefly
+stepping out of range does not lock the machine. The pending lock is cancelled if the phone
+returns to `Near` during the window. The timer is tick-based rather than clock-based so the
+behavior is unit-testable without sleeping.
 
 ## Locking
 
