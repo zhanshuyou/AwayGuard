@@ -5,18 +5,21 @@
     type Config, type DiscoveredDevice, type MonitorStatus, type LockBackend,
   } from "$lib/api";
 
-  // Must match the server-side floor in src-tauri/src/commands.rs
-  // (normalize_thresholds's MIN_THRESHOLD_GAP_DBM). Keeping near_dbm >
-  // away_dbm here is a UX nicety -- the backend re-enforces it on every
-  // set_config call regardless, since it is the one that must never fail
-  // open.
-  const MIN_GAP_DBM = 1;
+  // Must match the server-side floor in src-tauri/src/config.rs
+  // (Config::normalize_thresholds's MIN_THRESHOLD_GAP_DBM). Keeping
+  // near_dbm > away_dbm here is a UX nicety -- the backend re-enforces it
+  // on every set_config call regardless, since it is the one that must
+  // never fail open. Measured RSSI spread on real hardware is ~20 dB, so
+  // this must be a genuinely usable band, not just a non-empty one -- a
+  // 1 dB gap yields conclusive evidence on effectively every poll.
+  const MIN_GAP_DBM = 12;
 
   let config = $state<Config | null>(null);
   let status = $state<MonitorStatus | null>(null);
   let devices = $state<DiscoveredDevice[]>([]);
   let backend = $state<LockBackend>("unavailable");
   let scanning = $state(false);
+  let saveError = $state<string | null>(null);
 
   onMount(async () => {
     config = await getConfig();
@@ -31,7 +34,17 @@
   }
 
   async function save() {
-    if (config) await setConfig(config);
+    if (!config) return;
+    try {
+      await setConfig(config);
+      saveError = null;
+    } catch (e) {
+      // Previously an unawaited/uncaught rejection here vanished silently:
+      // the checkbox stayed ticked (it's bound to frontend-local state)
+      // while the backend's in-memory config could be stale, so the UI
+      // showed "armed" with no guarantee the backend agreed.
+      saveError = e instanceof Error ? e.message : String(e);
+    }
   }
 
   // The away and near sliders have overlapping legal ranges (-100..-50 and
@@ -63,8 +76,23 @@
     {/if}
   </header>
 
+  {#if status}
+    <!-- Distinct from the "Lock screen when I walk away" checkbox below,
+         which is only the user's desired/local state. This reflects what
+         the backend is actually doing, so a broken config/polling chain
+         (checkbox ticked, backend not receiving it, or the monitor loop
+         dead) is visible instead of silently invisible. -->
+    <p class="armed-state {status.armed ? 'on' : 'off'}">
+      Backend is {status.armed ? "armed" : "not armed"}
+    </p>
+  {/if}
+
   {#if status?.error}
     <p class="error">⚠ {status.error}</p>
+  {/if}
+
+  {#if saveError}
+    <p class="error">⚠ Failed to save settings: {saveError}</p>
   {/if}
 
   {#if backend === "screenSaver"}
@@ -100,7 +128,7 @@
         Away below {config.away_dbm} dBm
         <input
           type="range"
-          min="-100"
+          min="-105"
           max="-50"
           bind:value={config.away_dbm}
           oninput={clampAway}
@@ -118,13 +146,31 @@
           onchange={save}
         />
       </label>
+      <label>
+        Grace period before locking: {config.grace_seconds}s
+        <input
+          type="range"
+          min="0"
+          max="60"
+          bind:value={config.grace_seconds}
+          onchange={save}
+        />
+      </label>
     </section>
 
     <section>
       <label class="arm">
-        <input type="checkbox" bind:checked={config.armed} onchange={save} />
+        <input
+          type="checkbox"
+          bind:checked={config.armed}
+          onchange={save}
+          disabled={!config.target_id}
+        />
         Lock screen when I walk away
       </label>
+      {#if !config.target_id}
+        <p class="hint">Select a device above before arming.</p>
+      {/if}
     </section>
   {/if}
 </main>
@@ -141,4 +187,8 @@
   .arm { display: flex; gap: 8px; align-items: center; }
   .error { color: #b00020; margin: 0; }
   .warn { color: #8a6100; margin: 0; }
+  .hint { color: #666; margin: 0; font-size: 11px; }
+  .armed-state { margin: 0; font-size: 11px; }
+  .armed-state.on { color: #1a7a34; }
+  .armed-state.off { color: #666; }
 </style>

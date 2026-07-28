@@ -7,7 +7,12 @@ const FILE_NAME: &str = "config.json";
 /// state machine (`ProximityTracker::push`) checks the "near" branch
 /// first, so if `near_dbm <= away_dbm` the tracker reports Near forever
 /// and the app never locks -- silently, while still appearing armed.
-const MIN_THRESHOLD_GAP_DBM: i16 = 1;
+///
+/// This must be a genuinely usable hysteresis band, not just a non-empty
+/// one: measured RSSI spread on real hardware is ~20 dB, so a band as
+/// narrow as 1 dB still yields conclusive evidence on effectively every
+/// poll and can lock the screen from three unlucky samples at the desk.
+const MIN_THRESHOLD_GAP_DBM: i16 = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -89,7 +94,7 @@ mod tests {
         let dir = std::env::temp_dir().join("awayguard-test-missing");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(Config::load(&dir).armed, false);
+        assert!(!Config::load(&dir).armed);
     }
 
     #[test]
@@ -98,10 +103,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut c = Config::default();
-        c.target_id = Some("18b1c44c-6313-7e59-ccfb-4aa35e765c2d".into());
-        c.armed = true;
-        c.grace_seconds = 12;
+        let c = Config {
+            target_id: Some("18b1c44c-6313-7e59-ccfb-4aa35e765c2d".into()),
+            armed: true,
+            grace_seconds: 12,
+            ..Config::default()
+        };
         c.save(&dir).unwrap();
 
         let back = Config::load(&dir);
@@ -134,7 +141,7 @@ mod tests {
         c.normalize_thresholds();
         assert!(c.near_dbm > c.away_dbm);
         assert_eq!(c.away_dbm, -60);
-        assert_eq!(c.near_dbm, -59);
+        assert_eq!(c.near_dbm, -60 + MIN_THRESHOLD_GAP_DBM);
     }
 
     #[test]

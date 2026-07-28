@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::api::{Central, Manager as _, Peripheral as _, PeripheralProperties, ScanFilter};
 use btleplug::platform::{Adapter, Manager};
 use serde::Serialize;
 use std::sync::Mutex;
@@ -73,20 +73,34 @@ impl ProximitySource for BleSource {
     async fn sample(&self, target_id: &str) -> Result<Option<i16>, String> {
         for p in self.central.peripherals().await.map_err(|e| e.to_string())? {
             if p.id().to_string() == target_id {
-                // Peripheral is present. A properties() failure here is a sensor
-                // fault, NOT evidence of departure — propagate as Err so the
-                // caller does not feed it to the state machine as a missing
-                // sample (see the trait doc comment).
-                let props = p.properties().await.map_err(|e| e.to_string())?;
-                // Ok(None) here means present-but-no-cached-RSSI this round,
-                // which is genuinely ambiguous in btleplug's API and is
-                // reported the same as "not seen".
-                return Ok(props.and_then(|pr| pr.rssi));
+                // Peripheral is present. resolve_sample() decides what a
+                // properties() failure here means (a sensor fault, NOT
+                // evidence of departure -- see its doc comment).
+                let props = p.properties().await.map_err(|e| e.to_string());
+                return resolve_sample(props);
             }
         }
         // Peripheral absent from the scan cache — the real "departed" signal.
         Ok(None)
     }
+}
+
+/// Pure decision logic for one `sample()` lookup, split out of `BleSource::sample`
+/// so it is unit-testable without real Bluetooth hardware.
+///
+/// - `Err`: a sensor fault (e.g. `properties()` failed) while the peripheral
+///   IS present. Propagated as-is -- this is NOT evidence of departure and
+///   must not become `Ok(None)` (which the state machine reads as "not
+///   seen"). This is the invariant LEDGER 1 exists to guarantee: an error
+///   here must never silently look like a missing sample.
+/// - `Ok(Some(props))`: peripheral present. `props.rssi` is `None` when it
+///   has no cached RSSI this round, which is genuinely ambiguous in
+///   btleplug's API and reported the same as "not seen".
+/// - `Ok(None)`: not reachable from `BleSource::sample`'s call site (it only
+///   calls this after finding the peripheral), included for completeness.
+fn resolve_sample(properties: Result<Option<PeripheralProperties>, String>) -> Result<Option<i16>, String> {
+    let props = properties?;
+    Ok(props.and_then(|pr| pr.rssi))
 }
 
 /// Test double: replays a fixed sample sequence, repeating the last value.
@@ -140,5 +154,33 @@ mod tests {
         let src = FakeSource::new(vec![Some(-50)]);
         assert_eq!(src.sample("any").await.unwrap(), Some(-50));
         assert_eq!(src.sample("any").await.unwrap(), Some(-50));
+    }
+
+    // LEDGER 1(a): resolve_sample is the pure core of BleSource::sample --
+    // exercised here with no hardware and no mocking, since
+    // PeripheralProperties derives Default.
+
+    #[test]
+    fn resolve_sample_propagates_a_sensor_fault_as_err() {
+        // A properties() failure for a present peripheral is NOT evidence of
+        // departure; it must come out as Err, never silently become Ok(None).
+        assert_eq!(resolve_sample(Err("adapter reset".into())), Err("adapter reset".to_string()));
+    }
+
+    #[test]
+    fn resolve_sample_extracts_rssi_when_present() {
+        let props = PeripheralProperties { rssi: Some(-55), ..Default::default() };
+        assert_eq!(resolve_sample(Ok(Some(props))), Ok(Some(-55)));
+    }
+
+    #[test]
+    fn resolve_sample_is_none_when_present_but_no_cached_rssi() {
+        let props = PeripheralProperties { rssi: None, ..Default::default() };
+        assert_eq!(resolve_sample(Ok(Some(props))), Ok(None));
+    }
+
+    #[test]
+    fn resolve_sample_is_none_when_peripheral_absent() {
+        assert_eq!(resolve_sample(Ok(None)), Ok(None));
     }
 }

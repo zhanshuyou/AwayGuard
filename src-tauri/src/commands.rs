@@ -21,9 +21,13 @@ pub fn set_config(state: State<'_, AppState>, mut config: Config) -> Result<(), 
     // inside Config::load(), so a crossed config can never reach the
     // running app regardless of how it got onto disk.
     config.normalize_thresholds();
-    config.save(&state.config_dir)?;
-    *state.config.lock().unwrap() = config;
-    Ok(())
+    // In-memory config is updated first and unconditionally, so it stays
+    // authoritative even if the on-disk save fails (read-only/full dir,
+    // permissions, ...). Previously `config.save(...)?` ran first: a save
+    // error meant the polling loop kept using the OLD in-memory config
+    // while the frontend believed the new one had taken effect.
+    *state.config.lock().unwrap() = config.clone();
+    config.save(&state.config_dir)
 }
 
 #[tauri::command]

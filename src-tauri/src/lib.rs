@@ -10,11 +10,17 @@ pub mod proximity;
 use crate::ble::{BleSource, ProximitySource};
 use crate::config::Config;
 use crate::lock::{MacScreenLocker, ScreenLocker};
-use crate::monitor::{run_once, MonitorStatus};
+use crate::monitor::{run_once, GraceTimer, MonitorStatus};
 use crate::proximity::{Presence, ProximityTracker, Thresholds};
 use std::sync::{Arc, Mutex};
-use tauri::tray::TrayIconBuilder;
+use std::time::Duration;
+use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{Emitter, Manager};
+
+/// The polling loop's cadence. Used both as the `sleep` between rounds and
+/// as the `elapsed` tick fed to the grace-period countdown, so the grace
+/// timer's accumulated time actually tracks wall-clock time.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct AppState {
     pub source: Arc<dyn ProximitySource>,
@@ -22,6 +28,26 @@ pub struct AppState {
     pub config: Mutex<Config>,
     pub status: Mutex<MonitorStatus>,
     pub config_dir: std::path::PathBuf,
+    /// Kept so the polling loop can push presence/armed/error into the
+    /// tray tooltip -- for a menu bar app whose popover is hidden by
+    /// default, the tray is the only surface that's always visible.
+    pub tray: TrayIcon<tauri::Wry>,
+}
+
+/// One-line tray tooltip summarizing the current monitoring state. An error
+/// takes priority over everything else, since it means the sensing chain
+/// itself may be broken -- exactly what must never be silently invisible.
+fn tray_tooltip(status: &MonitorStatus) -> String {
+    if let Some(e) = &status.error {
+        return format!("AwayGuard — error: {e}");
+    }
+    let armed = if status.armed { "armed" } else { "not armed" };
+    let presence = match status.presence {
+        Presence::Unknown => "unknown",
+        Presence::Near => "near",
+        Presence::Away => "away",
+    };
+    format!("AwayGuard — {armed} · {presence}")
 }
 
 /// Applies `config`'s thresholds to `tracker`, but only when they actually
@@ -67,23 +93,11 @@ pub fn run() {
             );
             let locker: Arc<dyn ScreenLocker> = Arc::new(MacScreenLocker::detect());
 
-            let state = AppState {
-                source: source.clone(),
-                locker: locker.clone(),
-                status: Mutex::new(MonitorStatus {
-                    presence: Presence::Unknown,
-                    rssi: None,
-                    armed: config.armed,
-                    error: None,
-                }),
-                config: Mutex::new(config),
-                config_dir,
-            };
-            app.manage(state);
-
-            TrayIconBuilder::new()
+            // Built before AppState so the tray handle can be stored in it
+            // and used by the polling loop to keep the tooltip live.
+            let tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("AwayGuard")
+                .tooltip("AwayGuard — starting…")
                 .on_tray_icon_event(|tray, _event| {
                     if let Some(w) = tray.app_handle().get_webview_window("main") {
                         let _ = if w.is_visible().unwrap_or(false) {
@@ -95,9 +109,24 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            let state = AppState {
+                source: source.clone(),
+                locker: locker.clone(),
+                status: Mutex::new(MonitorStatus {
+                    presence: Presence::Unknown,
+                    rssi: None,
+                    armed: config.armed,
+                    error: None,
+                }),
+                config: Mutex::new(config),
+                config_dir,
+                tray,
+            };
+            app.manage(state);
+
             // Polling loop.
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
+            let poll_task = tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
                 let mut current_thresholds = {
                     let c = state.config.lock().unwrap();
@@ -108,28 +137,73 @@ pub fn run() {
                     }
                 };
                 let mut tracker = ProximityTracker::new(current_thresholds);
+                let mut grace = GraceTimer::new();
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let (armed, target) = {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    let (armed, target, grace_seconds) = {
                         let c = state.config.lock().unwrap();
                         // Pick up any near_dbm/away_dbm/confirm_samples edit made
                         // via set_config since the last round, without resetting
                         // the tracker's accumulated EMA/streak.
                         sync_thresholds(&mut tracker, &mut current_thresholds, &c);
-                        (c.armed, c.target_id.clone())
+                        (c.armed, c.target_id.clone(), c.grace_seconds)
                     };
-                    let Some(target) = target else { continue };
+                    let Some(target) = target else {
+                        // No device selected yet: previously this bare
+                        // `continue`d, leaving status/tray stuck on
+                        // whatever they last showed forever -- including a
+                        // ticked "armed" checkbox with nothing actually
+                        // being monitored (IMPORTANT 1). Surface it.
+                        let status = MonitorStatus {
+                            presence: tracker.state(),
+                            rssi: tracker.smoothed_rssi(),
+                            armed,
+                            error: Some("no device selected".to_string()),
+                        };
+                        *state.status.lock().unwrap() = status.clone();
+                        let _ = state.tray.set_tooltip(Some(tray_tooltip(&status)));
+                        let _ = handle.emit("status", status);
+                        continue;
+                    };
                     let status = run_once(
                         state.source.as_ref(),
                         &mut tracker,
+                        &mut grace,
                         state.locker.as_ref(),
                         armed,
                         &target,
+                        grace_seconds,
+                        POLL_INTERVAL,
                     )
                     .await;
                     *state.status.lock().unwrap() = status.clone();
+                    let _ = state.tray.set_tooltip(Some(tray_tooltip(&status)));
                     let _ = handle.emit("status", status);
                 }
+            });
+
+            // LEDGER 2: the polling task's JoinHandle was previously
+            // discarded, so a panic in it killed monitoring silently --
+            // state.status kept its last value forever and the UI kept
+            // serving a stale "everything is fine" snapshot. Await it from
+            // a supervisor task instead: the loop above never returns
+            // normally, so reaching here means it died, and that must be
+            // surfaced exactly like any other broken sensing chain.
+            let watchdog_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let result = poll_task.await;
+                let state = watchdog_handle.state::<AppState>();
+                let message = match result {
+                    Ok(()) => "monitoring stopped unexpectedly".to_string(),
+                    Err(e) => format!("monitoring stopped: {e}"),
+                };
+                let status = {
+                    let mut s = state.status.lock().unwrap();
+                    s.error = Some(message);
+                    s.clone()
+                };
+                let _ = state.tray.set_tooltip(Some(tray_tooltip(&status)));
+                let _ = watchdog_handle.emit("status", status);
             });
 
             Ok(())
@@ -194,12 +268,14 @@ mod tests {
         let mut tracker = ProximityTracker::new(current);
         let locker = RecordingLocker::new();
 
+        let mut grace = GraceTimer::new();
+
         // Establish Near under the original thresholds.
         let original = config_with(-70, -85, 3);
         let source = FakeSource::new(vec![Some(-40), Some(-40), Some(-40)]);
         for _ in 0..3 {
             sync_thresholds(&mut tracker, &mut current, &original);
-            run_once(&source, &mut tracker, &locker, original.armed, "fake-device").await;
+            run_once(&source, &mut tracker, &mut grace, &locker, original.armed, "fake-device", original.grace_seconds, POLL_INTERVAL).await;
         }
         assert_eq!(tracker.state(), Presence::Near);
 
@@ -212,7 +288,7 @@ mod tests {
         for _ in 0..3 {
             sync_thresholds(&mut tracker, &mut current, &tightened);
             let status =
-                run_once(&source2, &mut tracker, &locker, tightened.armed, "fake-device").await;
+                run_once(&source2, &mut tracker, &mut grace, &locker, tightened.armed, "fake-device", tightened.grace_seconds, POLL_INTERVAL).await;
             if status.presence == Presence::Away {
                 saw_away = true;
             }
@@ -231,6 +307,7 @@ mod tests {
         // never confirm and the locker would never be called.
         let mut current = Thresholds { near_dbm: -70, away_dbm: -85, confirm_samples: 3 };
         let mut tracker = ProximityTracker::new(current);
+        let mut grace = GraceTimer::new();
         let locker = RecordingLocker::new();
         let config = config_with(-70, -85, 3);
 
@@ -238,18 +315,21 @@ mod tests {
         let establish = FakeSource::new(vec![Some(-40), Some(-40), Some(-40)]);
         for _ in 0..3 {
             sync_thresholds(&mut tracker, &mut current, &config);
-            run_once(&establish, &mut tracker, &locker, config.armed, "fake-device").await;
+            run_once(&establish, &mut tracker, &mut grace, &locker, config.armed, "fake-device", config.grace_seconds, POLL_INTERVAL).await;
         }
         assert_eq!(tracker.state(), Presence::Near);
 
         // Depart over many rounds with an UNCHANGED config each round --
         // exactly what a real 2-second polling loop does while the user
-        // isn't touching the UI.
+        // isn't touching the UI. config.grace_seconds is 10 (config_with)
+        // and POLL_INTERVAL is 2s, so the confirmed departure (around round
+        // 6) plus 4 more rounds (10s of grace) still fits comfortably
+        // inside these 12 rounds.
         let depart = FakeSource::new(vec![Some(-100)]); // FakeSource repeats the last value
         let mut locked = false;
         for _ in 0..12 {
             sync_thresholds(&mut tracker, &mut current, &config);
-            let status = run_once(&depart, &mut tracker, &locker, config.armed, "fake-device").await;
+            let status = run_once(&depart, &mut tracker, &mut grace, &locker, config.armed, "fake-device", config.grace_seconds, POLL_INTERVAL).await;
             if status.presence == Presence::Away {
                 locked = true;
             }
