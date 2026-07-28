@@ -14,9 +14,20 @@ pub struct DiscoveredDevice {
 
 #[async_trait]
 pub trait ProximitySource: Send + Sync {
-    /// Scan for `secs` and return named devices, strongest signal first.
+    /// Sleep `secs`, then return every named device accumulated in the adapter's
+    /// scan cache since the scan was started (in `BleSource::new`), strongest
+    /// cached signal first. This can include devices no longer in range and
+    /// possibly-stale RSSI, since no new scan is started here.
     async fn discover(&self, secs: u64) -> Result<Vec<DiscoveredDevice>, String>;
-    /// Current RSSI for one peripheral. `Ok(None)` means "not seen this round".
+    /// Current RSSI for one peripheral, matched by `id` only.
+    ///
+    /// - `Ok(Some(rssi))`: the peripheral is present and has a cached reading.
+    /// - `Ok(None)`: the peripheral is absent from the scan cache (the real
+    ///   "departed" signal), OR it is present but has no cached RSSI this
+    ///   round (ambiguous in btleplug's API — also reported as "not seen").
+    /// - `Err`: a sensor fault (e.g. `properties()` failed) while the
+    ///   peripheral IS present. This is NOT evidence of departure and must
+    ///   not be fed to the proximity state machine as a missing sample.
     async fn sample(&self, target_id: &str) -> Result<Option<i16>, String>;
 }
 
@@ -62,11 +73,18 @@ impl ProximitySource for BleSource {
     async fn sample(&self, target_id: &str) -> Result<Option<i16>, String> {
         for p in self.central.peripherals().await.map_err(|e| e.to_string())? {
             if p.id().to_string() == target_id {
-                if let Ok(Some(props)) = p.properties().await {
-                    return Ok(props.rssi);
-                }
+                // Peripheral is present. A properties() failure here is a sensor
+                // fault, NOT evidence of departure — propagate as Err so the
+                // caller does not feed it to the state machine as a missing
+                // sample (see the trait doc comment).
+                let props = p.properties().await.map_err(|e| e.to_string())?;
+                // Ok(None) here means present-but-no-cached-RSSI this round,
+                // which is genuinely ambiguous in btleplug's API and is
+                // reported the same as "not seen".
+                return Ok(props.and_then(|pr| pr.rssi));
             }
         }
+        // Peripheral absent from the scan cache — the real "departed" signal.
         Ok(None)
     }
 }
