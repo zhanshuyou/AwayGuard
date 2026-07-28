@@ -106,13 +106,24 @@ mod tests {
 
     #[tokio::test]
     async fn never_locks_while_disarmed() {
-        let source = FakeSource::new(vec![Some(-40), Some(-100), Some(-100), Some(-100)]);
+        // Same fixture as locks_once_on_departure: 6 consecutive -100 samples
+        // are required from a -40 baseline to actually cross the Near -> Away
+        // transition (see that test's comment for the verified arithmetic).
+        // Using a fixture that never reaches the transition would let this
+        // test pass even with the `armed &&` guard deleted from run_once, so
+        // we drive a real departure and then assert it happened.
+        let source = FakeSource::new(vec![
+            Some(-40), Some(-40), Some(-40),                             // establish Near
+            Some(-100), Some(-100), Some(-100), Some(-100), Some(-100), Some(-100), // depart
+        ]);
         let locker = RecordingLocker::new();
         let mut t = tracker();
-        for _ in 0..6 {
-            run_once(&source, &mut t, &locker, false, "fake-device").await;
+        let mut last = None;
+        for _ in 0..12 {
+            last = Some(run_once(&source, &mut t, &locker, false, "fake-device").await);
         }
-        assert_eq!(locker.calls(), 0);
+        assert_eq!(last.unwrap().presence, Presence::Away, "fixture must actually reach departure");
+        assert_eq!(locker.calls(), 0, "disarmed must never lock, even on a real departure");
     }
 
     #[tokio::test]
