@@ -84,10 +84,19 @@ out of range does not lock the machine.
 ## Locking
 
 `ScreenLocker` is a trait. The macOS implementation `dlopen`s
-`/System/Library/PrivateFrameworks/login.framework/…/login` and calls `SACLockScreenImmediate`.
-If the symbol cannot be resolved — a plausible outcome on a future macOS — it falls back to
-executing `CGSession -suspend`. Which path is active is surfaced in the UI, so the user is never
-misled about whether a real lock will happen.
+`/System/Library/PrivateFrameworks/login.framework/Versions/A/login` and calls
+`SACLockScreenImmediate`. This was verified to resolve on macOS 26 (symbol found at a live
+address; resolution tested without invoking it).
+
+**The fallback had to be revised.** The originally planned `CGSession -suspend` **does not exist on
+modern macOS** — `/System/Library/CoreServices/Menu Extras/User.menu/` has been removed entirely.
+The fallback is instead launching `/System/Library/CoreServices/ScreenSaverEngine.app`.
+
+That fallback is strictly weaker: it only locks if the user has "require password after screen
+saver begins" enabled, and `com.apple.screensaver askForPassword` is **no longer readable from the
+user defaults domain**, so the app cannot verify that the setting is on. When running on the
+fallback path the UI must therefore state that a lock is not guaranteed, rather than implying the
+machine is secured. Which path is active is surfaced in the UI either way.
 
 ## Failure posture
 
