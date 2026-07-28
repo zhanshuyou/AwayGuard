@@ -25,5 +25,10 @@ serde_json = "1"
 libc = "0.2.189"
 btleplug = "0.12.0"
 async-trait = "0.1.91"
+futures = "0.3.33"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[dev-dependencies]
+# Only needed to construct btleplug PeripheralIds in liveness unit tests.
+uuid = "1"
 
