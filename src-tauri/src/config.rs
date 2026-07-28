@@ -42,10 +42,18 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Enforce `near_dbm > away_dbm` in place. If the two are crossed or
-    /// equal, `near_dbm` is nudged up just above `away_dbm` -- the
-    /// smallest change that restores a non-empty hysteresis band without
-    /// silently discarding the caller's intended `away_dbm`.
+    /// Enforce a `near_dbm - away_dbm >= MIN_THRESHOLD_GAP_DBM` floor in
+    /// place. If the gap is crossed, equal, or simply too narrow to be a
+    /// usable hysteresis band, `near_dbm` is nudged up to exactly
+    /// `away_dbm + MIN_THRESHOLD_GAP_DBM` -- the smallest change that
+    /// restores a genuinely usable band without silently discarding the
+    /// caller's intended `away_dbm`.
+    ///
+    /// This is a floor check (`< MIN_THRESHOLD_GAP_DBM`), not just a
+    /// crossing check (`near_dbm <= away_dbm`): an uncrossed but narrow
+    /// pair like near=-70/away=-71 is still a 1 dB band against ~20 dB of
+    /// measured RSSI noise, and previously passed through untouched
+    /// because it never crossed.
     ///
     /// This lives on `Config` itself (rather than only in the `set_config`
     /// command) so it is impossible to bypass: it also runs inside
@@ -53,7 +61,7 @@ impl Config {
     /// (from disk, written by an older build, hand-edited, or otherwise
     /// already crossed).
     pub fn normalize_thresholds(&mut self) {
-        if self.near_dbm <= self.away_dbm {
+        if self.near_dbm.saturating_sub(self.away_dbm) < MIN_THRESHOLD_GAP_DBM {
             self.near_dbm = self.away_dbm.saturating_add(MIN_THRESHOLD_GAP_DBM);
         }
     }
@@ -142,6 +150,19 @@ mod tests {
         assert!(c.near_dbm > c.away_dbm);
         assert_eq!(c.away_dbm, -60);
         assert_eq!(c.near_dbm, -60 + MIN_THRESHOLD_GAP_DBM);
+    }
+
+    #[test]
+    fn normalize_thresholds_enforces_a_floor_even_when_not_crossed() {
+        // near_dbm > away_dbm here (never crosses), but the gap is only
+        // 1 dB -- against ~20 dB of measured RSSI noise, that reaches the
+        // running tracker as conclusive evidence on effectively every
+        // poll. The old crossing-only check (`near_dbm <= away_dbm`)
+        // let this straight through.
+        let mut c = Config { near_dbm: -70, away_dbm: -71, ..Config::default() };
+        c.normalize_thresholds();
+        assert_eq!(c.away_dbm, -71, "away_dbm must not be silently discarded");
+        assert_eq!(c.near_dbm, -71 + MIN_THRESHOLD_GAP_DBM, "gap must be widened to the full floor");
     }
 
     #[test]

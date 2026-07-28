@@ -85,20 +85,42 @@ pub async fn run_once(
 ) -> MonitorStatus {
     let prev_state = tracker.state();
 
+    // Disarming must immediately cancel any pending countdown, not merely
+    // freeze it. It used to only be gated out of *starting*/*advancing* via
+    // `armed &&` below, while cancellation only checked presence -- so a
+    // countdown pending at the moment of disarming just sat there frozen,
+    // and resumed (and could fire) the instant the user re-armed, even
+    // though the phone never re-established a confirmed Near baseline in
+    // between. This check must run before the early-return-on-error path
+    // below too, so a fault while disarmed still cancels it.
+    if !armed {
+        grace.cancel();
+    }
+
     let (sample, error) = match source.sample(target_id).await {
         Ok(v) => (v, None),
-        // A sensor error is NOT evidence of departure. Report it and do not
-        // feed the state machine, so a broken adapter cannot lock the machine.
-        // The pending grace countdown (if any) is left untouched: a sensor
-        // hiccup is not a reason to cancel a departure that was already
-        // confirmed, nor to advance it.
+        // A sensor error is NOT evidence of departure -- never feed it to
+        // the state machine, and never let it START a countdown (that only
+        // happens below, on a real confirmed transition). But once a
+        // departure is already confirmed and its grace countdown pending,
+        // the fault must not stall it forever: the user is away, and a
+        // countdown that can never complete because the adapter keeps
+        // erroring is as bad as never confirming the departure at all. So a
+        // pending countdown still advances (and can still fire) through a
+        // run of errors; the fault is surfaced in `error` either way.
         Err(e) => {
-            return MonitorStatus {
+            let mut status = MonitorStatus {
                 presence: tracker.state(),
                 rssi: tracker.smoothed_rssi(),
                 armed,
                 error: Some(e),
+            };
+            if armed && grace.advance(elapsed, Duration::from_secs(grace_seconds)) {
+                if let Err(le) = locker.lock() {
+                    status.error = Some(format!("lock failed: {le}"));
+                }
             }
+            return status;
         }
     };
 
@@ -394,6 +416,91 @@ mod tests {
             last.unwrap().error,
             Some("sensor fault".to_string()),
             "the fault must reach MonitorStatus.error, not be swallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn disarm_cancels_pending_countdown_and_rearm_does_not_resume_it() {
+        // CRITICAL regression (final review round): grace.start()/advance()
+        // were gated on `armed`, but cancellation only checked presence --
+        // so a pending countdown neither advanced nor cancelled while
+        // disarmed, it just froze. Re-arming while still Away resumed the
+        // stale countdown and locked without ever re-confirming Near,
+        // defeating the Unknown -> Away guard's entire purpose.
+        let source = FakeSource::new(vec![
+            Some(-40), Some(-40), Some(-40),
+            Some(-100), Some(-100), Some(-100), Some(-100), Some(-100), Some(-100),
+        ]);
+        let locker = RecordingLocker::new();
+        let mut t = tracker();
+        let mut grace = GraceTimer::new();
+        let grace_seconds = 4; // small enough that a resumed countdown would fire immediately
+        let tick = Duration::from_secs(2);
+
+        // Rounds 1-9: establish Near, then confirm the departure (armed).
+        for _ in 0..9 {
+            run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+        }
+        assert_eq!(t.state(), Presence::Away, "fixture must actually confirm departure");
+        assert!(grace.is_pending(), "a confirmed departure must start the grace countdown");
+        assert_eq!(locker.calls(), 0, "grace period has not elapsed yet");
+
+        // User disarms while still away. Many disarmed rounds pass -- the
+        // countdown must never fire while disarmed, and must actually be
+        // cancelled (not just frozen).
+        for _ in 0..50 {
+            run_once(&source, &mut t, &mut grace, &locker, false, "fake-device", grace_seconds, tick).await;
+        }
+        assert_eq!(locker.calls(), 0, "must never lock while disarmed");
+        assert!(!grace.is_pending(), "disarming must cancel the pending countdown, not just freeze it");
+
+        // User re-arms while the phone is still away -- no fresh Near
+        // baseline was ever re-established in between. This must NOT
+        // resume the stale countdown and lock: that would fire with the
+        // user at the keyboard, having never left since re-arming.
+        for _ in 0..10 {
+            run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+        }
+        assert_eq!(
+            locker.calls(), 0,
+            "re-arming while already away must not lock without a fresh confirmed Near -> Away departure"
+        );
+    }
+
+    #[tokio::test]
+    async fn sensor_fault_during_pending_grace_still_advances_and_locks() {
+        // IMPORTANT regression (final review round): the early return on
+        // Err used to skip grace.advance() entirely, so a fault that began
+        // right after a confirmed departure and persisted would stall the
+        // countdown forever -- the user is away, the error is surfaced,
+        // but the screen never locks. A pending countdown must still
+        // complete on schedule even if every subsequent poll faults.
+        let confirm_source = FakeSource::new(vec![
+            Some(-40), Some(-40), Some(-40),
+            Some(-100), Some(-100), Some(-100), Some(-100), Some(-100), Some(-100),
+        ]);
+        let locker = RecordingLocker::new();
+        let mut t = tracker();
+        let mut grace = GraceTimer::new();
+        let grace_seconds = 4;
+        let tick = Duration::from_secs(2);
+
+        for _ in 0..9 {
+            run_once(&confirm_source, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+        }
+        assert!(grace.is_pending(), "a confirmed departure must start the grace countdown");
+        assert_eq!(locker.calls(), 0, "2s of 4s accumulated -- not due yet");
+
+        // The adapter now faults on every poll. The pending countdown must
+        // still complete (2s already accumulated + this round's 2s = 4s).
+        let error_source = ErrorSource;
+        let status = run_once(&error_source, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+
+        assert_eq!(locker.calls(), 1, "a pending grace countdown must still complete and lock even while the sensor is erroring");
+        assert_eq!(
+            status.error,
+            Some("sensor fault".to_string()),
+            "the fault must still be surfaced even though the lock fired"
         );
     }
 

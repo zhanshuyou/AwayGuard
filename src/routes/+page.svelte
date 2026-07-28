@@ -47,22 +47,25 @@
     }
   }
 
-  // The away and near sliders have overlapping legal ranges (-100..-50 and
-  // -90..-30). Without this, dragging one past the other produces
-  // near_dbm <= away_dbm, which makes the "near" branch of the proximity
-  // state machine win forever -- the app looks armed and healthy but can
-  // never lock. Clamp each slider against its sibling as it moves so the
-  // crossed state is simply unreachable from the UI.
+  // The away and near sliders have overlapping legal ranges (-105..-50 and
+  // -90..-30). These are floor checks (>= near - MIN_GAP_DBM), not just
+  // crossing checks (>= near) -- dragging Away up to one notch below Near
+  // (e.g. near=-70, away=-71) never crosses, but is still a 1 dB band
+  // against ~20 dB of measured RSSI noise, and previously slipped through
+  // untouched because it never crossed. Clamp each slider against its
+  // sibling as it moves so a sub-floor band is simply unreachable from the
+  // UI (the backend re-enforces the same floor regardless, since it is the
+  // one that must never fail open).
   function clampAway() {
     if (!config) return;
-    if (config.away_dbm >= config.near_dbm) {
+    if (config.away_dbm >= config.near_dbm - MIN_GAP_DBM) {
       config.away_dbm = config.near_dbm - MIN_GAP_DBM;
     }
   }
 
   function clampNear() {
     if (!config) return;
-    if (config.near_dbm <= config.away_dbm) {
+    if (config.near_dbm <= config.away_dbm + MIN_GAP_DBM) {
       config.near_dbm = config.away_dbm + MIN_GAP_DBM;
     }
   }
