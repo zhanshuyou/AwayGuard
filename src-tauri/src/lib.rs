@@ -3,6 +3,7 @@
 pub mod ble;
 pub mod config;
 pub mod lock;
+pub mod monitor;
 pub mod proximity;
 
 #[tauri::command]
