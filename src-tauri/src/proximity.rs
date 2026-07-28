@@ -43,6 +43,22 @@ impl ProximityTracker {
         self.smoothed
     }
 
+    /// Swap in new thresholds without resetting the EMA (`smoothed`), the
+    /// confirmed `state`, or the in-progress confirmation streak
+    /// (`pending`/`streak`). Only the boundary used by `push` to compute
+    /// evidence changes.
+    ///
+    /// This exists so a running app can pick up a user's edited
+    /// near_dbm/away_dbm/confirm_samples without restarting. Rebuilding
+    /// the tracker from scratch instead (`*self = ProximityTracker::new(t)`)
+    /// would silently reset the streak on every poll if called
+    /// unconditionally, which would prevent the tracker from ever
+    /// confirming a transition -- strictly worse than not picking up the
+    /// new thresholds at all.
+    pub fn set_thresholds(&mut self, thresholds: Thresholds) {
+        self.thresholds = thresholds;
+    }
+
     /// Feed one scan round. `None` means the peripheral was not seen at all.
     /// Returns `Some(new_state)` only on an actual transition.
     pub fn push(&mut self, sample: Option<i16>) -> Option<Presence> {
@@ -216,5 +232,23 @@ mod tests {
         assert_eq!(t.push(Some(-95)), None);
         assert_eq!(t.push(Some(-95)), None);
         assert_eq!(t.push(Some(-95)), Some(Presence::Away));
+    }
+
+    #[test]
+    fn set_thresholds_preserves_smoothed_value_and_confirmed_state() {
+        // Simulates the user editing near_dbm/away_dbm while the app is
+        // running: the EMA and the already-confirmed state must survive,
+        // only the boundary used for future evidence should change.
+        let mut t = ProximityTracker::new(thresholds());
+        for _ in 0..3 {
+            t.push(Some(-40));
+        }
+        assert_eq!(t.state(), Presence::Near);
+        let smoothed_before = t.smoothed_rssi();
+
+        t.set_thresholds(Thresholds { near_dbm: -60, away_dbm: -90, confirm_samples: 3 });
+
+        assert_eq!(t.smoothed_rssi(), smoothed_before);
+        assert_eq!(t.state(), Presence::Near);
     }
 }

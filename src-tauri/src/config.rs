@@ -3,6 +3,12 @@ use std::path::Path;
 
 const FILE_NAME: &str = "config.json";
 
+/// Minimum required gap between `near_dbm` and `away_dbm`. The proximity
+/// state machine (`ProximityTracker::push`) checks the "near" branch
+/// first, so if `near_dbm <= away_dbm` the tracker reports Near forever
+/// and the app never locks -- silently, while still appearing armed.
+const MIN_THRESHOLD_GAP_DBM: i16 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub target_id: Option<String>,
@@ -31,13 +37,31 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Enforce `near_dbm > away_dbm` in place. If the two are crossed or
+    /// equal, `near_dbm` is nudged up just above `away_dbm` -- the
+    /// smallest change that restores a non-empty hysteresis band without
+    /// silently discarding the caller's intended `away_dbm`.
+    ///
+    /// This lives on `Config` itself (rather than only in the `set_config`
+    /// command) so it is impossible to bypass: it also runs inside
+    /// `load()`, which is the only other place a `Config` enters the app
+    /// (from disk, written by an older build, hand-edited, or otherwise
+    /// already crossed).
+    pub fn normalize_thresholds(&mut self) {
+        if self.near_dbm <= self.away_dbm {
+            self.near_dbm = self.away_dbm.saturating_add(MIN_THRESHOLD_GAP_DBM);
+        }
+    }
+
     pub fn load(dir: &Path) -> Config {
         // Any failure falls back to defaults, which are disarmed.
         // Never inherit a half-parsed armed state.
-        std::fs::read_to_string(dir.join(FILE_NAME))
+        let mut config: Config = std::fs::read_to_string(dir.join(FILE_NAME))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        config.normalize_thresholds();
+        config
     }
 
     pub fn save(&self, dir: &Path) -> Result<(), String> {
@@ -94,5 +118,52 @@ mod tests {
         std::fs::write(dir.join("config.json"), b"{ not json").unwrap();
         // Must not panic, and must not silently arm.
         assert!(!Config::load(&dir).armed);
+    }
+
+    #[test]
+    fn normalize_thresholds_leaves_a_valid_gap_untouched() {
+        let mut c = Config { near_dbm: -70, away_dbm: -85, ..Config::default() };
+        c.normalize_thresholds();
+        assert_eq!((c.near_dbm, c.away_dbm), (-70, -85));
+    }
+
+    #[test]
+    fn normalize_thresholds_fixes_crossed_values() {
+        // near_dbm below away_dbm: the "never locks" fail-open case.
+        let mut c = Config { near_dbm: -90, away_dbm: -60, ..Config::default() };
+        c.normalize_thresholds();
+        assert!(c.near_dbm > c.away_dbm);
+        assert_eq!(c.away_dbm, -60);
+        assert_eq!(c.near_dbm, -59);
+    }
+
+    #[test]
+    fn normalize_thresholds_fixes_equal_values() {
+        let mut c = Config { near_dbm: -70, away_dbm: -70, ..Config::default() };
+        c.normalize_thresholds();
+        assert!(c.near_dbm > c.away_dbm);
+    }
+
+    #[test]
+    fn load_normalizes_a_crossed_config_found_on_disk() {
+        // Simulates a config written by an older build, or hand-edited,
+        // that predates the near/away gap invariant. load() must not
+        // hand a crossed config to the running app even though the JSON
+        // itself is well-formed.
+        let dir = std::env::temp_dir().join("awayguard-test-crossed-on-disk");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let crossed = Config { near_dbm: -90, away_dbm: -60, ..Config::default() };
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&crossed).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = Config::load(&dir);
+        assert!(
+            loaded.near_dbm > loaded.away_dbm,
+            "load() must normalize a crossed config already on disk"
+        );
     }
 }
