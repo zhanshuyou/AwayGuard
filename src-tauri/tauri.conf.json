@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "awayguard",
+  "productName": "AwayGuard",
   "version": "0.1.0",
   "identifier": "com.shuyou.awayguard",
   "build": {
@@ -12,9 +12,14 @@
   "app": {
     "windows": [
       {
-        "title": "awayguard",
-        "width": 800,
-        "height": 600
+        "title": "AwayGuard",
+        "width": 360,
+        "height": 480,
+        "visible": false,
+        "resizable": false,
+        "decorations": false,
+        "skipTaskbar": true,
+        "alwaysOnTop": true
       }
     ],
     "security": {

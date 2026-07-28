@@ -1,156 +1,144 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { onMount } from "svelte";
+  import {
+    listDevices, getConfig, setConfig, getStatus, lockBackend, onStatus,
+    type Config, type DiscoveredDevice, type MonitorStatus, type LockBackend,
+  } from "$lib/api";
 
-  let name = $state("");
-  let greetMsg = $state("");
+  // Must match the server-side floor in src-tauri/src/commands.rs
+  // (normalize_thresholds's MIN_THRESHOLD_GAP_DBM). Keeping near_dbm >
+  // away_dbm here is a UX nicety -- the backend re-enforces it on every
+  // set_config call regardless, since it is the one that must never fail
+  // open.
+  const MIN_GAP_DBM = 1;
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
+  let config = $state<Config | null>(null);
+  let status = $state<MonitorStatus | null>(null);
+  let devices = $state<DiscoveredDevice[]>([]);
+  let backend = $state<LockBackend>("unavailable");
+  let scanning = $state(false);
+
+  onMount(async () => {
+    config = await getConfig();
+    status = await getStatus();
+    backend = await lockBackend();
+    onStatus((s) => (status = s));
+  });
+
+  async function scan() {
+    scanning = true;
+    try { devices = await listDevices(); } finally { scanning = false; }
+  }
+
+  async function save() {
+    if (config) await setConfig(config);
+  }
+
+  // The away and near sliders have overlapping legal ranges (-100..-50 and
+  // -90..-30). Without this, dragging one past the other produces
+  // near_dbm <= away_dbm, which makes the "near" branch of the proximity
+  // state machine win forever -- the app looks armed and healthy but can
+  // never lock. Clamp each slider against its sibling as it moves so the
+  // crossed state is simply unreachable from the UI.
+  function clampAway() {
+    if (!config) return;
+    if (config.away_dbm >= config.near_dbm) {
+      config.away_dbm = config.near_dbm - MIN_GAP_DBM;
+    }
+  }
+
+  function clampNear() {
+    if (!config) return;
+    if (config.near_dbm <= config.away_dbm) {
+      config.near_dbm = config.away_dbm + MIN_GAP_DBM;
+    }
   }
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<main>
+  <header>
+    <h1>AwayGuard</h1>
+    {#if status}
+      <span class="badge {status.presence}">{status.presence}</span>
+    {/if}
+  </header>
 
-  <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
-  </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
+  {#if status?.error}
+    <p class="error">⚠ {status.error}</p>
+  {/if}
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
+  {#if backend === "screenSaver"}
+    <p class="warn">
+      Using the screen saver fallback — a lock is not guaranteed unless
+      "require password after screen saver begins" is enabled.
+    </p>
+  {:else if backend === "unavailable"}
+    <p class="error">No screen lock mechanism available on this system.</p>
+  {/if}
+
+  {#if config}
+    <section>
+      <button onclick={scan} disabled={scanning}>
+        {scanning ? "Scanning…" : "Scan for devices"}
+      </button>
+      {#if devices.length}
+        <select bind:value={config.target_id} onchange={save}>
+          <option value={null}>— pick your iPhone —</option>
+          {#each devices as d}
+            <option value={d.id}>{d.name} ({d.rssi ?? "?"} dBm)</option>
+          {/each}
+        </select>
+      {/if}
+    </section>
+
+    <section>
+      <label>
+        Signal reading
+        <strong>{status?.rssi ? status.rssi.toFixed(1) : "—"} dBm</strong>
+      </label>
+      <label>
+        Away below {config.away_dbm} dBm
+        <input
+          type="range"
+          min="-100"
+          max="-50"
+          bind:value={config.away_dbm}
+          oninput={clampAway}
+          onchange={save}
+        />
+      </label>
+      <label>
+        Near above {config.near_dbm} dBm
+        <input
+          type="range"
+          min="-90"
+          max="-30"
+          bind:value={config.near_dbm}
+          oninput={clampNear}
+          onchange={save}
+        />
+      </label>
+    </section>
+
+    <section>
+      <label class="arm">
+        <input type="checkbox" bind:checked={config.armed} onchange={save} />
+        Lock screen when I walk away
+      </label>
+    </section>
+  {/if}
 </main>
 
 <style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
-
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
-
+  main { font: 13px -apple-system, system-ui; padding: 12px; display: grid; gap: 14px; }
+  header { display: flex; align-items: center; justify-content: space-between; }
+  h1 { font-size: 15px; margin: 0; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #eee; }
+  .badge.near { background: #d7f5dd; }
+  .badge.away { background: #fde2e1; }
+  section { display: grid; gap: 8px; }
+  label { display: grid; gap: 4px; }
+  .arm { display: flex; gap: 8px; align-items: center; }
+  .error { color: #b00020; margin: 0; }
+  .warn { color: #8a6100; margin: 0; }
 </style>
