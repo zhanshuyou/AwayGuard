@@ -118,11 +118,15 @@ mod tests {
     }
 
     #[test]
-    fn single_weak_sample_does_not_flip_to_away() {
-        // The core anti-flap guarantee: measured RSSI dips ~20 dB spontaneously.
+    fn ema_smoothing_dampens_single_burst_dip() {
+        // EMA damping: a single burst dip (one -95 sample) is not strong enough evidence
+        // to flip away, because the smoothed value stays in Near territory.
+        // This verifies the exponential smoothing coefficient α=0.35 is low enough
+        // to ride out the ~20 dB spontaneous dips measured on real hardware.
         let mut t = ProximityTracker::new(thresholds());
         for _ in 0..3 { t.push(Some(-40)); }
         assert_eq!(t.state(), Presence::Near);
+        // Single -95 sample: smoothed = -40 + 0.35*(-95 - -40) = -59.25, still >= -70.
         assert_eq!(t.push(Some(-95)), None);
         assert_eq!(t.state(), Presence::Near);
     }
@@ -169,5 +173,49 @@ mod tests {
         assert_eq!(t.push(Some(-40)), Some(Presence::Near));
         assert_eq!(t.push(Some(-40)), None);
         assert_eq!(t.push(Some(-40)), None);
+    }
+
+    #[test]
+    fn interrupt_resets_partial_streak() {
+        // Streak mechanism must reset completely on inconclusive evidence,
+        // requiring a fresh full confirmation sequence. This is the core
+        // defense against off-by-one early transitions if streak counters lingered.
+        let mut t = ProximityTracker::new(thresholds());
+        for _ in 0..3 { t.push(Some(-40)); }
+        assert_eq!(t.state(), Presence::Near);
+
+        // Push weak samples to accumulate partial away-evidence without transitioning.
+        // Arithmetic: after 3×(-40), smoothed = -40.
+        // Push 1 (-95): -40 + 0.35*(-55) = -59.25 (≥ -70, evidence=Near, matches state)
+        // Push 2 (-95): -59.25 + 0.35*(-35.75) = -71.76 (between -85 and -70, evidence=None)
+        // Push 3 (-95): -71.76 + 0.35*(-23.24) = -79.90 (evidence=None)
+        // Push 4 (-95): -79.90 + 0.35*(-15.10) = -85.18 (≤ -85, evidence=Away, streak=1)
+        // Push 5 (-95): -85.18 + 0.35*(-9.82) = -88.62 (evidence=Away, streak=2)
+        for _ in 0..5 {
+            assert_eq!(t.push(Some(-95)), None);
+        }
+        assert_eq!(t.state(), Presence::Near);
+
+        // Interrupt the away-streak with an inconclusive sample.
+        // Smoothed drops to -71.60 (in hysteresis band), evidence=None.
+        // This must reset pending and streak to 0.
+        t.push(Some(-40));
+
+        // Feed weak samples again. The state machine must now require a full fresh
+        // confirm_samples (3) rounds of genuine away-evidence before transitioning,
+        // not a shortened streak from residual pending counter.
+        // Arithmetic: after interrupt, smoothed = -71.60.
+        // Push 1 (-95): -71.60 + 0.35*(-23.40) = -79.79 (evidence=None)
+        // Push 2 (-95): -79.79 + 0.35*(-15.21) = -85.11 (≤ -85, evidence=Away, streak=1)
+        // Push 3 (-95): -85.11 + 0.35*(-9.89) ≈ -88.6 (evidence=Away, streak=2)
+        // Push 4 (-95): evidence=Away, streak=3, transition!
+        let mut transition = None;
+        for _ in 0..5 {
+            if let Some(s) = t.push(Some(-95)) {
+                transition = Some(s);
+                break;
+            }
+        }
+        assert_eq!(transition, Some(Presence::Away));
     }
 }
