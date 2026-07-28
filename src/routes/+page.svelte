@@ -17,15 +17,30 @@
   let config = $state<Config | null>(null);
   let status = $state<MonitorStatus | null>(null);
   let devices = $state<DiscoveredDevice[]>([]);
-  let backend = $state<LockBackend>("unavailable");
+  // `null` means "not yet determined". Defaulting this to "unavailable"
+  // made a failed startup indistinguishable from a genuine lack of any
+  // lock mechanism, so the panel accused the OS of the frontend's problem.
+  let backend = $state<LockBackend | null>(null);
   let scanning = $state(false);
   let saveError = $state<string | null>(null);
+  let initError = $state<string | null>(null);
 
   onMount(async () => {
-    config = await getConfig();
-    status = await getStatus();
-    backend = await lockBackend();
-    onStatus((s) => (status = s));
+    // Previously uncaught: a rejection here left `config` null, so the whole
+    // panel body silently vanished and the untouched `backend` default
+    // rendered a misleading "no lock mechanism" error. Report what actually
+    // failed, and name the call that failed it.
+    let step = "get_config";
+    try {
+      config = await getConfig();
+      step = "get_status";
+      status = await getStatus();
+      step = "lock_backend";
+      backend = await lockBackend();
+      onStatus((s) => (status = s));
+    } catch (e) {
+      initError = `startup failed at ${step}: ${e}`;
+    }
   });
 
   async function scan() {
@@ -105,6 +120,10 @@
     </p>
   {:else if backend === "unavailable"}
     <p class="error">No screen lock mechanism available on this system.</p>
+  {/if}
+
+  {#if initError}
+    <p class="error">⚠ {initError}</p>
   {/if}
 
   {#if config}
