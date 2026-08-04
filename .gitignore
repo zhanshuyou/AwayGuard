@@ -16,3 +16,4 @@ vite.config.ts.timestamp-*
 /.superpowers
 /.claude
 /openspec
+/.opencode
