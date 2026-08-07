@@ -38,6 +38,8 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "shortDescription": "Locks your Mac when you walk away from it.",
+    "longDescription": "AwayGuard is a macOS menu bar app that watches the Bluetooth signal from your iPhone. When the phone leaves range it starts a short countdown, and if you don't come back it locks the screen — proximity-driven, not idle-timer-driven.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
