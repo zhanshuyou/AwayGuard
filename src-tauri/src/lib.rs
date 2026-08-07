@@ -13,9 +13,9 @@ use crate::lock::{MacScreenLocker, ScreenLocker};
 use crate::monitor::{run_once, GraceTimer, Liveness, MonitorStatus};
 use crate::proximity::{Presence, ProximityTracker, Thresholds};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{Emitter, Manager, PhysicalPosition, Rect, WebviewWindow};
+use tauri::{Emitter, Manager, PhysicalPosition, Rect, WebviewWindow, WindowEvent};
 
 /// The polling loop's cadence. Used both as the `sleep` between rounds and
 /// as the `elapsed` tick fed to the grace-period countdown, so the grace
@@ -61,6 +61,14 @@ const TRAY_GAP: f64 = 6.0;
 /// Tray icons sit near the right of the menu bar, so a 320pt panel centred
 /// under the rightmost one would otherwise hang off the screen.
 const SCREEN_MARGIN: f64 = 8.0;
+/// How soon after an outside-click dismissal a tray click still counts as
+/// *being* that dismissal rather than a fresh open.
+///
+/// Comfortably longer than a normal click (50-120ms) and short enough that
+/// a deliberate open right after dismissing the panel some other way isn't
+/// swallowed. A click held longer than this falls through and reopens the
+/// panel -- visible, harmless, and corrected by the next click.
+const REOPEN_GUARD: Duration = Duration::from_millis(250);
 
 /// Parks the popover directly beneath the tray icon that was clicked,
 /// centred on it, and nudges it back on-screen if that would push it past
@@ -158,32 +166,53 @@ pub fn run() {
             );
             let locker: Arc<dyn ScreenLocker> = Arc::new(MacScreenLocker::detect());
 
+            // When the panel was last dismissed by a click outside it.
+            // Shared by the two handlers below, which would otherwise fight
+            // each other over a click on the tray icon -- see REOPEN_GUARD.
+            let dismissed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+
             // Built before AppState so the tray handle can be stored in it
             // and used by the polling loop to keep the tooltip live.
             let tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("AwayGuard — starting…")
-                .on_tray_icon_event(|tray, event| {
-                    // Only a completed left click toggles. This handler also
-                    // receives Enter/Move/Leave and the button-*down* half of
-                    // every click; the previous `|_event|` treated all of them
-                    // alike, so merely moving the pointer across the icon
-                    // flapped the panel open and shut.
-                    let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        rect,
-                        ..
-                    } = event
-                    else {
-                        return;
-                    };
-                    let Some(window) = tray.app_handle().get_webview_window("main") else {
-                        return;
-                    };
-                    if window.is_visible().unwrap_or(false) {
-                        let _ = window.hide();
-                    } else {
+                .on_tray_icon_event({
+                    let dismissed_at = dismissed_at.clone();
+                    move |tray, event| {
+                        // Only a completed left click toggles. This handler
+                        // also receives Enter/Move/Leave and the button-*down*
+                        // half of every click; the original `|_event|` treated
+                        // all of them alike, so merely moving the pointer
+                        // across the icon flapped the panel open and shut.
+                        let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            rect,
+                            ..
+                        } = event
+                        else {
+                            return;
+                        };
+                        let Some(window) = tray.app_handle().get_webview_window("main") else {
+                            return;
+                        };
+                        if window.is_visible().unwrap_or(false) {
+                            let _ = window.hide();
+                            return;
+                        }
+                        // Pressing the icon while the panel is open makes the
+                        // status item key first, so the outside-click handler
+                        // below has already hidden the panel by the time this
+                        // fires. Without the guard the click would reopen what
+                        // it just closed and the icon would look inert.
+                        if dismissed_at
+                            .lock()
+                            .unwrap()
+                            .take_if(|at| at.elapsed() < REOPEN_GUARD)
+                            .is_some()
+                        {
+                            return;
+                        }
                         // Position while still hidden, so the panel never
                         // flashes at wherever it was last parked -- which,
                         // for a window that opens under a menu bar icon the
@@ -194,6 +223,24 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // A popover is dismissed by clicking away from it, which macOS
+            // reports as the window resigning key.
+            {
+                let window = app
+                    .get_webview_window("main")
+                    .ok_or_else(|| std::io::Error::other("the \"main\" window is missing"))?;
+                let panel = window.clone();
+                let dismissed_at = dismissed_at.clone();
+                window.on_window_event(move |event| {
+                    if matches!(event, WindowEvent::Focused(false))
+                        && panel.is_visible().unwrap_or(false)
+                    {
+                        *dismissed_at.lock().unwrap() = Some(Instant::now());
+                        let _ = panel.hide();
+                    }
+                });
+            }
 
             let state = AppState {
                 source: source.clone(),
