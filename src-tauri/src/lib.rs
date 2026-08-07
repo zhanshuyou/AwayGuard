@@ -6,12 +6,14 @@ pub mod config;
 pub mod lock;
 pub mod monitor;
 pub mod proximity;
+pub mod tray_glyph;
 
 use crate::ble::{BleSource, ProximitySource};
 use crate::config::Config;
 use crate::lock::{MacScreenLocker, ScreenLocker};
 use crate::monitor::{run_once, GraceTimer, Liveness, MonitorStatus};
 use crate::proximity::{Presence, ProximityTracker, Thresholds};
+use crate::tray_glyph::TrayGlyph;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -53,6 +55,38 @@ fn tray_tooltip(status: &MonitorStatus) -> String {
         Presence::Away => "away",
     };
     format!("AwayGuard — {armed} · {presence}")
+}
+
+/// Pushes a status snapshot onto the menu bar: the tooltip text and the
+/// template glyph that has to answer "am I protected right now?" without
+/// being clicked.
+///
+/// `shown` is the glyph currently on screen. Redrawing it costs a hop to the
+/// main thread every poll for an image that has not changed, so the icon is
+/// only pushed when the state actually moves -- and `shown` is left untouched
+/// if that push fails, so the next poll retries instead of believing a glyph
+/// is up that never made it.
+fn update_tray(
+    tray: &TrayIcon<tauri::Wry>,
+    status: &MonitorStatus,
+    has_target: bool,
+    shown: &mut Option<TrayGlyph>,
+) {
+    let _ = tray.set_tooltip(Some(tray_tooltip(status)));
+    let glyph = TrayGlyph::for_status(status, has_target);
+    if *shown == Some(glyph) {
+        return;
+    }
+    // Not `set_icon`: on macOS that hardcodes the template flag to false, so
+    // the glyph would stop being tinted by the system and show up as a black
+    // smudge on a dark menu bar. Setting both together is also the documented
+    // way to avoid the double-render flicker of two separate calls.
+    if tray
+        .set_icon_with_as_template(Some(glyph.image()), true)
+        .is_ok()
+    {
+        *shown = Some(glyph);
+    }
 }
 
 /// Gap between the menu bar and the top of the popover, in logical points.
@@ -174,7 +208,12 @@ pub fn run() {
             // Built before AppState so the tray handle can be stored in it
             // and used by the polling loop to keep the tooltip live.
             let tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+                // Not the app icon: the menu bar always gets the flat
+                // template, which macOS tints for light and dark bars. Before
+                // the first poll lands nothing is being watched yet, and the
+                // dimmed open lock says exactly that.
+                .icon(TrayGlyph::NoDevice.image())
+                .icon_as_template(true)
                 .tooltip("AwayGuard — starting…")
                 .on_tray_icon_event({
                     let dismissed_at = dismissed_at.clone();
@@ -277,6 +316,9 @@ pub fn run() {
                 };
                 let mut tracker = ProximityTracker::new(current_thresholds);
                 let mut liveness = Liveness::new();
+                // Matches the glyph the tray was built with, so the first
+                // poll only redraws if it has something new to say.
+                let mut shown_glyph = Some(TrayGlyph::NoDevice);
                 // Which device the accumulated EMA/streak/liveness above
                 // actually describe. Switching targets has to reset all of
                 // it: carrying a previous phone's smoothed RSSI and
@@ -328,7 +370,7 @@ pub fn run() {
                         };
                         drop(grace);
                         *state.status.lock().unwrap() = status.clone();
-                        let _ = state.tray.set_tooltip(Some(tray_tooltip(&status)));
+                        update_tray(&state.tray, &status, false, &mut shown_glyph);
                         let _ = handle.emit("status", status);
                         continue;
                     };
@@ -346,7 +388,7 @@ pub fn run() {
                     .await;
                     drop(grace);
                     *state.status.lock().unwrap() = status.clone();
-                    let _ = state.tray.set_tooltip(Some(tray_tooltip(&status)));
+                    update_tray(&state.tray, &status, true, &mut shown_glyph);
                     let _ = handle.emit("status", status);
                 }
             });
@@ -371,7 +413,11 @@ pub fn run() {
                     s.error = Some(message);
                     s.clone()
                 };
-                let _ = state.tray.set_tooltip(Some(tray_tooltip(&status)));
+                let has_target = state.config.lock().unwrap().target_id.is_some();
+                // A fresh `None`: the loop that was tracking the on-screen
+                // glyph is dead, so its last value is gone and this one push
+                // must happen whatever was showing.
+                update_tray(&state.tray, &status, has_target, &mut None);
                 let _ = watchdog_handle.emit("status", status);
             });
 
