@@ -43,6 +43,21 @@ impl ProximityTracker {
         self.smoothed
     }
 
+    /// The state evidence is currently accumulating for, if any, and how many
+    /// consecutive rounds of it we have. Exposed purely so the UI can say
+    /// "below the away threshold for 2 samples" -- a transition that is
+    /// underway but not yet confirmed is information the user is entitled to,
+    /// and hiding it makes the eventual state change look like it came from
+    /// nowhere. Neither accessor is allowed to influence a decision; `push`
+    /// remains the only thing that moves `state`.
+    pub fn pending(&self) -> Option<Presence> {
+        self.pending
+    }
+
+    pub fn streak(&self) -> u8 {
+        self.streak
+    }
+
     /// Swap in new thresholds without resetting the EMA (`smoothed`), the
     /// confirmed `state`, or the in-progress confirmation streak
     /// (`pending`/`streak`). Only the boundary used by `push` to compute

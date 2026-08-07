@@ -39,3 +39,48 @@ pub fn get_status(state: State<'_, AppState>) -> MonitorStatus {
 pub fn lock_backend(state: State<'_, AppState>) -> LockBackend {
     state.locker.backend()
 }
+
+/// "Cancel — I'm still here": stop the countdown that is about to lock the
+/// screen. Deliberately does NOT disarm. A cancelled countdown can only
+/// restart from a fresh confirmed Near -> Away departure (see
+/// `monitor::run_once`), so this dismisses exactly one pending lock and
+/// leaves the guard in place for the next real departure.
+#[tauri::command]
+pub async fn cancel_pending_lock(state: State<'_, AppState>) -> Result<(), String> {
+    state.grace.lock().await.cancel();
+    Ok(())
+}
+
+/// The settings panes the two banners point at. An enum rather than a URL
+/// parameter so the webview can only ever open these two known destinations,
+/// never an arbitrary one.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SettingsPane {
+    Bluetooth,
+    LockScreen,
+}
+
+#[tauri::command]
+pub fn open_settings(pane: SettingsPane) -> Result<(), String> {
+    let url = match pane {
+        SettingsPane::Bluetooth => "x-apple.systempreferences:com.apple.Bluetooth-Settings.extension",
+        SettingsPane::LockScreen => "x-apple.systempreferences:com.apple.Lock-Screen-Settings.extension",
+    };
+    std::process::Command::new("/usr/bin/open")
+        .arg(url)
+        .status()
+        .map_err(|e| format!("failed to open settings: {e}"))
+        .and_then(|s| {
+            if s.success() {
+                Ok(())
+            } else {
+                Err("settings pane could not be opened".into())
+            }
+        })
+}
+
+#[tauri::command]
+pub fn quit(app: tauri::AppHandle) {
+    app.exit(0);
+}
