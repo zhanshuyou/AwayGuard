@@ -1,0 +1,117 @@
+name: Release
+
+# Manual only. AwayGuard is a menu bar app people install by hand, so a
+# release is a deliberate act rather than something every push earns.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (default: v + the version in tauri.conf.json)'
+        required: false
+        type: string
+      draft:
+        description: 'Create the release as a draft, so you can review the notes and the .dmg before anyone sees it'
+        required: false
+        type: boolean
+        default: true
+      prerelease:
+        description: 'Mark the release as a prerelease'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    # macOS only, and arm64 by choice: the runner has to be Apple silicon to
+    # build the aarch64 half of the universal binary natively.
+    runs-on: macos-14
+    permissions:
+      # Needed to create the release and upload the bundles to it.
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the tag
+        id: meta
+        # The tag reaches the shell through the environment, never through
+        # ${{ }} interpolation: it is user input, and interpolating it into a
+        # run block would be a shell injection.
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          version="$(jq -r .version src-tauri/tauri.conf.json)"
+          tag="${REQUESTED_TAG:-v$version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag (tauri.conf.json version $version)"
+
+      - name: Refuse to overwrite an existing release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::$TAG already exists. Bump the version in src-tauri/tauri.conf.json (and package.json), or pass a different tag."
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Both halves of the universal binary.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # A release that ships broken decision logic is worse than no release.
+      # These are the checks that run without Bluetooth hardware or a screen.
+      - name: Typecheck the frontend
+        run: pnpm check
+
+      - name: Test the monitor, proximity and lock logic
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Unsigned and unnotarised — see the release notes below. To sign,
+          # add these repository secrets and uncomment:
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ steps.meta.outputs.tag }}
+          releaseName: AwayGuard ${{ steps.meta.outputs.version }}
+          releaseDraft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          args: --target universal-apple-darwin
+          releaseBody: |
+            A macOS menu bar app that locks your Mac when your iPhone leaves Bluetooth range.
+
+            **Install** — open the `.dmg` and drag AwayGuard to Applications.
+
+            This build is **not signed or notarised**, so the first launch is
+            blocked by Gatekeeper. Right-click the app and choose **Open**, then
+            confirm — or run `xattr -dr com.apple.quarantine /Applications/AwayGuard.app`.
+
+            AwayGuard asks for Bluetooth permission the first time you scan for
+            devices. It has no Dock icon and no window: look for the padlock in
+            the menu bar.
