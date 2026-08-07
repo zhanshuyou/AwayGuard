@@ -14,8 +14,8 @@ use crate::monitor::{run_once, GraceTimer, Liveness, MonitorStatus};
 use crate::proximity::{Presence, ProximityTracker, Thresholds};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::tray::{TrayIcon, TrayIconBuilder};
-use tauri::{Emitter, Manager};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager, PhysicalPosition, Rect, WebviewWindow};
 
 /// The polling loop's cadence. Used both as the `sleep` between rounds and
 /// as the `elapsed` tick fed to the grace-period countdown, so the grace
@@ -53,6 +53,66 @@ fn tray_tooltip(status: &MonitorStatus) -> String {
         Presence::Away => "away",
     };
     format!("AwayGuard — {armed} · {presence}")
+}
+
+/// Gap between the menu bar and the top of the popover, in logical points.
+const TRAY_GAP: f64 = 6.0;
+/// Breathing room kept between the popover and the edge of the display.
+/// Tray icons sit near the right of the menu bar, so a 320pt panel centred
+/// under the rightmost one would otherwise hang off the screen.
+const SCREEN_MARGIN: f64 = 8.0;
+
+/// Parks the popover directly beneath the tray icon that was clicked,
+/// centred on it, and nudges it back on-screen if that would push it past
+/// the display edge.
+///
+/// Everything is done in physical pixels: `rect` arrives in whatever unit
+/// the platform reported (hence the explicit conversion), while monitor
+/// geometry and `set_position` are only ever physical.
+fn position_under_tray(window: &WebviewWindow, rect: Rect) {
+    // macOS hands us the tray rect already in physical pixels, in the
+    // global top-left-origin space. Converting anyway is a no-op on a
+    // Physical value and the correct thing if a platform ever reports a
+    // Logical one.
+    let here = window.scale_factor().unwrap_or(1.0);
+    let icon_pos = rect.position.to_physical::<f64>(here);
+    let icon_size = rect.size.to_physical::<f64>(here);
+    let Ok(panel) = window.outer_size() else {
+        // Without our own size we cannot centre anything, and leaving the
+        // window where it is beats teleporting it somewhere arbitrary.
+        return;
+    };
+
+    // The display the icon is on -- with more than one monitor the primary
+    // one is frequently the wrong answer.
+    let monitor = window
+        .app_handle()
+        .monitor_from_point(icon_pos.x, icon_pos.y)
+        .ok()
+        .flatten();
+    // Measure the panel for the display it is about to appear on rather
+    // than the one it is currently parked on. Those differ on mixed-DPI
+    // setups, and centring at the wrong scale misses by half a panel.
+    let scale = monitor.as_ref().map_or(here, |m| m.scale_factor());
+    let size = panel.to_logical::<f64>(here);
+    let width = size.width * scale;
+
+    let mut x = icon_pos.x + icon_size.width / 2.0 - width / 2.0;
+    let mut y = icon_pos.y + icon_size.height + TRAY_GAP * scale;
+
+    if let Some(monitor) = monitor {
+        let area = monitor.work_area();
+        let margin = SCREEN_MARGIN * scale;
+        let left = f64::from(area.position.x) + margin;
+        let right = f64::from(area.position.x) + f64::from(area.size.width) - width - margin;
+        // `right.max(left)` guards a display too narrow for the panel plus
+        // its margins, where the bounds would otherwise be inverted and
+        // `clamp` would panic.
+        x = x.clamp(left, right.max(left));
+        y = y.max(f64::from(area.position.y));
+    }
+
+    let _ = window.set_position(PhysicalPosition::new(x, y));
 }
 
 /// Applies `config`'s thresholds to `tracker`, but only when they actually
@@ -103,13 +163,34 @@ pub fn run() {
             let tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("AwayGuard — starting…")
-                .on_tray_icon_event(|tray, _event| {
-                    if let Some(w) = tray.app_handle().get_webview_window("main") {
-                        let _ = if w.is_visible().unwrap_or(false) {
-                            w.hide()
-                        } else {
-                            w.show().and_then(|_| w.set_focus())
-                        };
+                .on_tray_icon_event(|tray, event| {
+                    // Only a completed left click toggles. This handler also
+                    // receives Enter/Move/Leave and the button-*down* half of
+                    // every click; the previous `|_event|` treated all of them
+                    // alike, so merely moving the pointer across the icon
+                    // flapped the panel open and shut.
+                    let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        rect,
+                        ..
+                    } = event
+                    else {
+                        return;
+                    };
+                    let Some(window) = tray.app_handle().get_webview_window("main") else {
+                        return;
+                    };
+                    if window.is_visible().unwrap_or(false) {
+                        let _ = window.hide();
+                    } else {
+                        // Position while still hidden, so the panel never
+                        // flashes at wherever it was last parked -- which,
+                        // for a window that opens under a menu bar icon the
+                        // user may have dragged, is often the wrong screen.
+                        position_under_tray(&window, rect);
+                        let _ = window.show();
+                        let _ = window.set_focus();
                     }
                 })
                 .build(app)?;
