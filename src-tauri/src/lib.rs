@@ -10,7 +10,7 @@ pub mod proximity;
 use crate::ble::{BleSource, ProximitySource};
 use crate::config::Config;
 use crate::lock::{MacScreenLocker, ScreenLocker};
-use crate::monitor::{run_once, GraceTimer, MonitorStatus};
+use crate::monitor::{run_once, GraceTimer, Liveness, MonitorStatus};
 use crate::proximity::{Presence, ProximityTracker, Thresholds};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,6 +32,11 @@ pub struct AppState {
     /// tray tooltip -- for a menu bar app whose popover is hidden by
     /// default, the tray is the only surface that's always visible.
     pub tray: TrayIcon<tauri::Wry>,
+    /// Shared with the polling loop so `cancel_pending_lock` ("I'm still
+    /// here") can stop an in-flight countdown at the moment the user asks,
+    /// rather than at the next poll. A `tokio` mutex, not a `std` one,
+    /// because the loop holds it across `run_once`'s `.await`.
+    pub grace: Arc<tokio::sync::Mutex<GraceTimer>>,
 }
 
 /// One-line tray tooltip summarizing the current monitoring state. An error
@@ -117,10 +122,16 @@ pub fn run() {
                     rssi: None,
                     armed: config.armed,
                     error: None,
+                    grace_remaining: None,
+                    last_seen: None,
+                    pending: None,
+                    pending_samples: 0,
+                    poll_interval: POLL_INTERVAL.as_secs(),
                 }),
                 config: Mutex::new(config),
                 config_dir,
                 tray,
+                grace: Arc::new(tokio::sync::Mutex::new(GraceTimer::new())),
             };
             app.manage(state);
 
@@ -137,7 +148,16 @@ pub fn run() {
                     }
                 };
                 let mut tracker = ProximityTracker::new(current_thresholds);
-                let mut grace = GraceTimer::new();
+                let mut liveness = Liveness::new();
+                // Which device the accumulated EMA/streak/liveness above
+                // actually describe. Switching targets has to reset all of
+                // it: carrying a previous phone's smoothed RSSI and
+                // "last seen" over would have the UI report freshness it
+                // never measured for the device now on screen.
+                let mut current_target: Option<String> = {
+                    let c = state.config.lock().unwrap();
+                    c.target_id.clone()
+                };
                 loop {
                     tokio::time::sleep(POLL_INTERVAL).await;
                     let (armed, target, grace_seconds) = {
@@ -148,6 +168,19 @@ pub fn run() {
                         sync_thresholds(&mut tracker, &mut current_thresholds, &c);
                         (c.armed, c.target_id.clone(), c.grace_seconds)
                     };
+                    // The shared timer is held across the whole round: a
+                    // concurrent `cancel_pending_lock` must either land
+                    // wholly before this round's `advance` or wholly after
+                    // it, never halfway through the decision to lock.
+                    let mut grace = state.grace.lock().await;
+                    if target != current_target {
+                        tracker = ProximityTracker::new(current_thresholds);
+                        liveness = Liveness::new();
+                        // A countdown belonging to the old device must not
+                        // outlive the switch and lock on the new one's behalf.
+                        grace.cancel();
+                        current_target = target.clone();
+                    }
                     let Some(target) = target else {
                         // No device selected yet: previously this bare
                         // `continue`d, leaving status/tray stuck on
@@ -159,7 +192,13 @@ pub fn run() {
                             rssi: tracker.smoothed_rssi(),
                             armed,
                             error: Some("no device selected".to_string()),
+                            grace_remaining: None,
+                            last_seen: None,
+                            pending: tracker.pending(),
+                            pending_samples: tracker.streak(),
+                            poll_interval: POLL_INTERVAL.as_secs(),
                         };
+                        drop(grace);
                         *state.status.lock().unwrap() = status.clone();
                         let _ = state.tray.set_tooltip(Some(tray_tooltip(&status)));
                         let _ = handle.emit("status", status);
@@ -169,6 +208,7 @@ pub fn run() {
                         state.source.as_ref(),
                         &mut tracker,
                         &mut grace,
+                        &mut liveness,
                         state.locker.as_ref(),
                         armed,
                         &target,
@@ -176,6 +216,7 @@ pub fn run() {
                         POLL_INTERVAL,
                     )
                     .await;
+                    drop(grace);
                     *state.status.lock().unwrap() = status.clone();
                     let _ = state.tray.set_tooltip(Some(tray_tooltip(&status)));
                     let _ = handle.emit("status", status);
@@ -214,6 +255,9 @@ pub fn run() {
             commands::set_config,
             commands::get_status,
             commands::lock_backend,
+            commands::cancel_pending_lock,
+            commands::open_settings,
+            commands::quit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -269,13 +313,14 @@ mod tests {
         let locker = RecordingLocker::new();
 
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
 
         // Establish Near under the original thresholds.
         let original = config_with(-70, -85, 3);
         let source = FakeSource::new(vec![Some(-40), Some(-40), Some(-40)]);
         for _ in 0..3 {
             sync_thresholds(&mut tracker, &mut current, &original);
-            run_once(&source, &mut tracker, &mut grace, &locker, original.armed, "fake-device", original.grace_seconds, POLL_INTERVAL).await;
+            run_once(&source, &mut tracker, &mut grace, &mut seen, &locker, original.armed, "fake-device", original.grace_seconds, POLL_INTERVAL).await;
         }
         assert_eq!(tracker.state(), Presence::Near);
 
@@ -288,7 +333,7 @@ mod tests {
         for _ in 0..3 {
             sync_thresholds(&mut tracker, &mut current, &tightened);
             let status =
-                run_once(&source2, &mut tracker, &mut grace, &locker, tightened.armed, "fake-device", tightened.grace_seconds, POLL_INTERVAL).await;
+                run_once(&source2, &mut tracker, &mut grace, &mut seen, &locker, tightened.armed, "fake-device", tightened.grace_seconds, POLL_INTERVAL).await;
             if status.presence == Presence::Away {
                 saw_away = true;
             }
@@ -308,6 +353,7 @@ mod tests {
         let mut current = Thresholds { near_dbm: -70, away_dbm: -85, confirm_samples: 3 };
         let mut tracker = ProximityTracker::new(current);
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         let locker = RecordingLocker::new();
         let config = config_with(-70, -85, 3);
 
@@ -315,7 +361,7 @@ mod tests {
         let establish = FakeSource::new(vec![Some(-40), Some(-40), Some(-40)]);
         for _ in 0..3 {
             sync_thresholds(&mut tracker, &mut current, &config);
-            run_once(&establish, &mut tracker, &mut grace, &locker, config.armed, "fake-device", config.grace_seconds, POLL_INTERVAL).await;
+            run_once(&establish, &mut tracker, &mut grace, &mut seen, &locker, config.armed, "fake-device", config.grace_seconds, POLL_INTERVAL).await;
         }
         assert_eq!(tracker.state(), Presence::Near);
 
@@ -329,7 +375,7 @@ mod tests {
         let mut locked = false;
         for _ in 0..12 {
             sync_thresholds(&mut tracker, &mut current, &config);
-            let status = run_once(&depart, &mut tracker, &mut grace, &locker, config.armed, "fake-device", config.grace_seconds, POLL_INTERVAL).await;
+            let status = run_once(&depart, &mut tracker, &mut grace, &mut seen, &locker, config.armed, "fake-device", config.grace_seconds, POLL_INTERVAL).await;
             if status.presence == Presence::Away {
                 locked = true;
             }

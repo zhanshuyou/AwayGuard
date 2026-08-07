@@ -1,0 +1,135 @@
+/*
+ * Design tokens for the AwayGuard popover.
+ *
+ * Values come straight from the "AwayGuard Popover" design doc, which is
+ * authored in oklch. The palette is deliberately dark-only: this is a
+ * vibrancy-backed macOS popover, not a page, so it never follows a light
+ * theme -- the material behind it is what changes, and the surface tints
+ * stay translucent so it can show through.
+ */
+
+:root {
+  /* Surfaces. The popover body is translucent on purpose; the window is
+     transparent and macOS paints the `popover` vibrancy material behind it. */
+  --surface: oklch(0.28 0.012 250 / 0.94);
+  --hairline: oklch(1 0 0 / 0.09);
+  --edge: oklch(1 0 0 / 0.12);
+
+  /* Fills, in ascending prominence. */
+  --fill-subtle: oklch(1 0 0 / 0.05);
+  --fill: oklch(1 0 0 / 0.09);
+  --fill-strong: oklch(1 0 0 / 0.14);
+  --fill-track: oklch(1 0 0 / 0.1);
+  --fill-border: oklch(1 0 0 / 0.08);
+
+  /* Text. */
+  --text: oklch(0.93 0.006 250);
+  --text-strong: oklch(0.9 0.008 250);
+  --text-muted: oklch(0.74 0.01 250);
+  --text-dim: oklch(0.66 0.01 250);
+  --text-faint: oklch(0.62 0.01 250);
+
+  /* State hues. Near is green, Away is orange, error is red, degraded is
+     amber. Shape and wording carry state first; these are the second signal. */
+  --near: oklch(0.76 0.08 165);
+  --near-text: oklch(0.86 0.05 165);
+  --near-fill: oklch(0.66 0.09 165);
+  --near-bg: oklch(0.72 0.07 165 / 0.16);
+  --near-edge: oklch(0.72 0.07 165 / 0.3);
+
+  --away: oklch(0.74 0.1 35);
+  --away-text: oklch(0.87 0.06 35);
+  --away-fill: oklch(0.7 0.09 35);
+  --away-bg: oklch(0.72 0.08 35 / 0.18);
+  --away-edge: oklch(0.72 0.08 35 / 0.32);
+
+  --danger: oklch(0.62 0.14 22);
+  --danger-text: oklch(0.93 0.03 22);
+  --danger-body: oklch(0.84 0.02 22);
+  --danger-bg: oklch(0.55 0.13 22 / 0.2);
+  --danger-edge: oklch(0.62 0.13 22 / 0.5);
+
+  --warn: oklch(0.78 0.1 80);
+  --warn-text: oklch(0.93 0.04 85);
+  --warn-body: oklch(0.86 0.03 85);
+  --warn-bg: oklch(0.72 0.09 80 / 0.15);
+  --warn-edge: oklch(0.72 0.09 80 / 0.4);
+
+  --thumb: oklch(0.97 0.004 250);
+  --thumb-edge: oklch(0 0 0 / 0.35);
+
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+    Helvetica, sans-serif;
+  --display: -apple-system, BlinkMacSystemFont, "SF Pro Display", Helvetica,
+    sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --pad: 14px;
+  --radius: 12px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  /* Transparent all the way down so the window's vibrancy material shows
+     through the popover's own translucent surface. */
+  background: transparent;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--sans);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  /* A popover is chrome, not a document: nothing here is selectable text
+     and a drag should never start an image drag. */
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+/* Uppercase monospace section label, used by every section header. */
+.eyebrow {
+  font: 500 10.5px/1 var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* Tabular figures wherever a number updates in place, so the layout doesn't
+   jitter as digits change. */
+.num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid oklch(0.8 0.06 232);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

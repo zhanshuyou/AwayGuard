@@ -10,16 +10,25 @@
     "frontendDist": "../build"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
+        "label": "main",
         "title": "AwayGuard",
-        "width": 360,
-        "height": 480,
+        "width": 320,
+        "height": 420,
         "visible": false,
         "resizable": false,
         "decorations": false,
+        "transparent": true,
+        "shadow": true,
         "skipTaskbar": true,
-        "alwaysOnTop": true
+        "alwaysOnTop": true,
+        "windowEffects": {
+          "effects": ["popover"],
+          "state": "followsWindowActiveState",
+          "radius": 12
+        }
       }
     ],
     "security": {

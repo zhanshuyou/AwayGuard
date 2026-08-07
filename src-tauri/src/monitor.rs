@@ -12,6 +12,89 @@ pub struct MonitorStatus {
     /// Set when the sensing chain itself is broken. While armed this must be
     /// surfaced, never swallowed — a silent failure looks identical to "safe".
     pub error: Option<String>,
+    /// Whole seconds left before a pending departure fires the lock; `None`
+    /// when nothing is counting down. The UI renders a live countdown from
+    /// this, so it has to be the timer's real remaining time and not a
+    /// frontend-side re-simulation of it.
+    pub grace_remaining: Option<u64>,
+    /// Seconds since the target last advertised; `None` until it has been
+    /// seen at all. Distinguishes "never seen" from "seen, then vanished",
+    /// which look identical if you only have `presence`.
+    pub last_seen: Option<u64>,
+    /// The state the tracker is accumulating evidence for and how many
+    /// consecutive samples of it. Lets the UI show a transition that is
+    /// underway before it is confirmed.
+    pub pending: Option<Presence>,
+    pub pending_samples: u8,
+    /// Poll cadence in seconds, so the UI can say how fresh these numbers are
+    /// instead of implying they are continuous.
+    pub poll_interval: u64,
+}
+
+/// Assembles the status the UI sees from the monitor's own state, so every
+/// number on screen comes from the thing that made the decision rather than
+/// from a frontend guess. One place to build it also means the four exit
+/// paths through `run_once` cannot drift apart in what they report.
+fn snapshot(
+    tracker: &ProximityTracker,
+    grace: &GraceTimer,
+    liveness: &Liveness,
+    armed: bool,
+    grace_seconds: u64,
+    poll_interval: Duration,
+    error: Option<String>,
+) -> MonitorStatus {
+    MonitorStatus {
+        presence: tracker.state(),
+        rssi: tracker.smoothed_rssi(),
+        armed,
+        error,
+        grace_remaining: grace
+            .remaining(Duration::from_secs(grace_seconds))
+            // Round up: one second still on the clock must never read as 0,
+            // which is the number the UI shows next to the word "Locking".
+            .map(|d| d.as_secs() + u64::from(d.subsec_nanos() > 0)),
+        last_seen: liveness.since_seen().map(|d| d.as_secs()),
+        pending: tracker.pending(),
+        pending_samples: tracker.streak(),
+        poll_interval: poll_interval.as_secs(),
+    }
+}
+
+/// How long it has been since the target actually advertised.
+///
+/// Deliberately pure, for the same reason `GraceTimer` is: the caller threads
+/// its own per-round tick in, so "the phone vanished four seconds ago" is
+/// testable without sleeping. Not seeing the peripheral and the adapter
+/// erroring are both misses — in either case we have no fresh evidence, and
+/// the UI must not imply we do.
+#[derive(Debug, Default)]
+pub struct Liveness {
+    /// `None` until the target has been seen even once, so a device that was
+    /// picked but never found reads as "never seen" rather than "seen 0s ago".
+    since_seen: Option<Duration>,
+}
+
+impl Liveness {
+    pub fn new() -> Self {
+        Self { since_seen: None }
+    }
+
+    /// The target advertised this round.
+    pub fn seen(&mut self) {
+        self.since_seen = Some(Duration::ZERO);
+    }
+
+    /// The target did not advertise this round (or we could not look).
+    pub fn missed(&mut self, tick: Duration) {
+        if let Some(d) = &mut self.since_seen {
+            *d += tick;
+        }
+    }
+
+    pub fn since_seen(&self) -> Option<Duration> {
+        self.since_seen
+    }
 }
 
 /// Tracks the grace period between a confirmed Near -> Away departure and
@@ -42,8 +125,20 @@ impl GraceTimer {
 
     /// Stop the countdown. Used when the phone returns to Near before the
     /// grace period elapses -- the pending lock must not fire.
+    ///
+    /// Also what the user's "I'm still here" button calls. Cancelling does
+    /// not disarm: the countdown can only start again from a fresh confirmed
+    /// Near -> Away departure (see `run_once`), so dismissing this one lock
+    /// never silently dismisses the next one.
     pub fn cancel(&mut self) {
         self.accumulated = None;
+    }
+
+    /// Time left before a pending countdown fires; `None` when nothing is
+    /// pending. Saturating, so a countdown that has already run past `grace`
+    /// (it fires on the next `advance`) reports zero rather than underflowing.
+    pub fn remaining(&self, grace: Duration) -> Option<Duration> {
+        self.accumulated.map(|acc| grace.saturating_sub(acc))
     }
 
     /// Advance a pending countdown by `tick`. Returns `true` exactly once,
@@ -77,6 +172,7 @@ pub async fn run_once(
     source: &dyn ProximitySource,
     tracker: &mut ProximityTracker,
     grace: &mut GraceTimer,
+    liveness: &mut Liveness,
     locker: &dyn ScreenLocker,
     armed: bool,
     target_id: &str,
@@ -109,20 +205,32 @@ pub async fn run_once(
         // pending countdown still advances (and can still fire) through a
         // run of errors; the fault is surfaced in `error` either way.
         Err(e) => {
-            let mut status = MonitorStatus {
-                presence: tracker.state(),
-                rssi: tracker.smoothed_rssi(),
-                armed,
-                error: Some(e),
-            };
+            // A fault is not a sighting: the staleness clock keeps running so
+            // the UI cannot show a reassuringly recent "last seen" while the
+            // adapter is actually broken.
+            liveness.missed(elapsed);
+            let mut error = Some(e);
             if armed && grace.advance(elapsed, Duration::from_secs(grace_seconds)) {
                 if let Err(le) = locker.lock() {
-                    status.error = Some(format!("lock failed: {le}"));
+                    error = Some(format!("lock failed: {le}"));
                 }
             }
-            return status;
+            return snapshot(
+                tracker,
+                grace,
+                liveness,
+                armed,
+                grace_seconds,
+                elapsed,
+                error,
+            );
         }
     };
+
+    match sample {
+        Some(_) => liveness.seen(),
+        None => liveness.missed(elapsed),
+    }
 
     let transition = tracker.push(sample);
 
@@ -140,21 +248,19 @@ pub async fn run_once(
 
     if armed && grace.advance(elapsed, Duration::from_secs(grace_seconds)) {
         if let Err(e) = locker.lock() {
-            return MonitorStatus {
-                presence: tracker.state(),
-                rssi: tracker.smoothed_rssi(),
+            return snapshot(
+                tracker,
+                grace,
+                liveness,
                 armed,
-                error: Some(format!("lock failed: {e}")),
-            };
+                grace_seconds,
+                elapsed,
+                Some(format!("lock failed: {e}")),
+            );
         }
     }
 
-    MonitorStatus {
-        presence: tracker.state(),
-        rssi: tracker.smoothed_rssi(),
-        armed,
-        error,
-    }
+    snapshot(tracker, grace, liveness, armed, grace_seconds, elapsed, error)
 }
 
 #[cfg(test)]
@@ -219,8 +325,9 @@ mod tests {
         let locker = RecordingLocker::new();
         let mut t = tracker();
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         for _ in 0..12 {
-            run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", NO_GRACE, NO_TICK).await;
+            run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", NO_GRACE, NO_TICK).await;
         }
         assert_eq!(locker.calls(), 1, "departure must lock exactly once");
     }
@@ -240,9 +347,10 @@ mod tests {
         let locker = RecordingLocker::new();
         let mut t = tracker();
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         let mut last = None;
         for _ in 0..12 {
-            last = Some(run_once(&source, &mut t, &mut grace, &locker, false, "fake-device", NO_GRACE, NO_TICK).await);
+            last = Some(run_once(&source, &mut t, &mut grace, &mut seen, &locker, false, "fake-device", NO_GRACE, NO_TICK).await);
         }
         assert_eq!(last.unwrap().presence, Presence::Away, "fixture must actually reach departure");
         assert_eq!(locker.calls(), 0, "disarmed must never lock, even on a real departure");
@@ -258,8 +366,9 @@ mod tests {
         let locker = RecordingLocker::new();
         let mut t = tracker();
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         for _ in 0..6 {
-            run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", NO_GRACE, NO_TICK).await;
+            run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", NO_GRACE, NO_TICK).await;
         }
         assert_eq!(locker.calls(), 0);
     }
@@ -270,9 +379,10 @@ mod tests {
         let locker = RecordingLocker::new();
         let mut t = tracker();
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         let mut last = None;
         for _ in 0..3 {
-            last = Some(run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", NO_GRACE, NO_TICK).await);
+            last = Some(run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", NO_GRACE, NO_TICK).await);
         }
         assert_eq!(last.unwrap().presence, Presence::Near);
     }
@@ -289,9 +399,10 @@ mod tests {
         let locker = RecordingLocker::new();
         let mut t = tracker();
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         let mut last = None;
         for _ in 0..6 {
-            last = Some(run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", NO_GRACE, NO_TICK).await);
+            last = Some(run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", NO_GRACE, NO_TICK).await);
         }
         assert_eq!(last.unwrap().presence, Presence::Away, "fixture must actually reach Away from Unknown");
         assert_eq!(locker.calls(), 0, "Unknown -> Away must never lock; only a confirmed Near -> Away departure may");
@@ -309,8 +420,9 @@ mod tests {
         let locker = RecordingLocker::new();
         let mut t = tracker();
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         for _ in 0..12 {
-            run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", NO_GRACE, NO_TICK).await;
+            run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", NO_GRACE, NO_TICK).await;
         }
         assert_eq!(locker.calls(), 1, "a departure from a confirmed Near state must lock");
     }
@@ -331,6 +443,7 @@ mod tests {
         let locker = RecordingLocker::new();
         let mut t = tracker();
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         let grace_seconds = 10;
         let tick = Duration::from_secs(2);
 
@@ -338,19 +451,19 @@ mod tests {
         // confirming round itself starts the countdown and contributes its
         // own tick (2s of the 10s grace).
         for _ in 0..9 {
-            run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+            run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
         }
         assert_eq!(locker.calls(), 0, "lock must not fire immediately on confirmed departure");
 
         // 3 more rounds bring accumulated grace time to 2 + 2*3 = 8s, still
         // short of the 10s grace period.
         for _ in 0..3 {
-            run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+            run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
         }
         assert_eq!(locker.calls(), 0, "grace period has not fully elapsed yet");
 
         // One more round crosses the 10s grace period.
-        run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+        run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
         assert_eq!(locker.calls(), 1, "lock must fire once the grace period elapses");
     }
 
@@ -368,11 +481,12 @@ mod tests {
         let locker = RecordingLocker::new();
         let mut t = tracker();
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         let grace_seconds = 1_000;
         let tick = Duration::from_secs(2);
 
         for _ in 0..12 {
-            run_once(&depart, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+            run_once(&depart, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
         }
         assert_eq!(t.state(), Presence::Away, "fixture must actually confirm departure");
         assert!(grace.is_pending(), "a confirmed departure must start the grace countdown");
@@ -380,7 +494,7 @@ mod tests {
         // Phone returns: feed strong samples until Near reconfirms.
         let ret = FakeSource::new(vec![Some(-40)]); // FakeSource repeats the last value
         for _ in 0..12 {
-            run_once(&ret, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+            run_once(&ret, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
             if t.state() == Presence::Near {
                 break;
             }
@@ -399,15 +513,16 @@ mod tests {
         let locker = RecordingLocker::new();
         let mut t = tracker();
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         for _ in 0..3 {
-            run_once(&near_source, &mut t, &mut grace, &locker, true, "fake-device", NO_GRACE, NO_TICK).await;
+            run_once(&near_source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", NO_GRACE, NO_TICK).await;
         }
         assert_eq!(t.state(), Presence::Near, "fixture must actually establish Near first");
 
         let error_source = ErrorSource;
         let mut last = None;
         for _ in 0..5 {
-            last = Some(run_once(&error_source, &mut t, &mut grace, &locker, true, "fake-device", NO_GRACE, NO_TICK).await);
+            last = Some(run_once(&error_source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", NO_GRACE, NO_TICK).await);
         }
 
         assert_eq!(t.state(), Presence::Near, "a sensor fault must not be fed to the state machine as evidence of departure");
@@ -434,12 +549,13 @@ mod tests {
         let locker = RecordingLocker::new();
         let mut t = tracker();
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         let grace_seconds = 4; // small enough that a resumed countdown would fire immediately
         let tick = Duration::from_secs(2);
 
         // Rounds 1-9: establish Near, then confirm the departure (armed).
         for _ in 0..9 {
-            run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+            run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
         }
         assert_eq!(t.state(), Presence::Away, "fixture must actually confirm departure");
         assert!(grace.is_pending(), "a confirmed departure must start the grace countdown");
@@ -449,7 +565,7 @@ mod tests {
         // countdown must never fire while disarmed, and must actually be
         // cancelled (not just frozen).
         for _ in 0..50 {
-            run_once(&source, &mut t, &mut grace, &locker, false, "fake-device", grace_seconds, tick).await;
+            run_once(&source, &mut t, &mut grace, &mut seen, &locker, false, "fake-device", grace_seconds, tick).await;
         }
         assert_eq!(locker.calls(), 0, "must never lock while disarmed");
         assert!(!grace.is_pending(), "disarming must cancel the pending countdown, not just freeze it");
@@ -459,7 +575,7 @@ mod tests {
         // resume the stale countdown and lock: that would fire with the
         // user at the keyboard, having never left since re-arming.
         for _ in 0..10 {
-            run_once(&source, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+            run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
         }
         assert_eq!(
             locker.calls(), 0,
@@ -482,11 +598,12 @@ mod tests {
         let locker = RecordingLocker::new();
         let mut t = tracker();
         let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
         let grace_seconds = 4;
         let tick = Duration::from_secs(2);
 
         for _ in 0..9 {
-            run_once(&confirm_source, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+            run_once(&confirm_source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
         }
         assert!(grace.is_pending(), "a confirmed departure must start the grace countdown");
         assert_eq!(locker.calls(), 0, "2s of 4s accumulated -- not due yet");
@@ -494,7 +611,7 @@ mod tests {
         // The adapter now faults on every poll. The pending countdown must
         // still complete (2s already accumulated + this round's 2s = 4s).
         let error_source = ErrorSource;
-        let status = run_once(&error_source, &mut t, &mut grace, &locker, true, "fake-device", grace_seconds, tick).await;
+        let status = run_once(&error_source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
 
         assert_eq!(locker.calls(), 1, "a pending grace countdown must still complete and lock even while the sensor is erroring");
         assert_eq!(
@@ -504,10 +621,170 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn status_reports_the_countdown_the_timer_is_actually_running() {
+        // The popover renders "Locking in Ns" straight from grace_remaining.
+        // If that number were re-simulated in the frontend it could disagree
+        // with the timer that will actually fire -- the one number on screen
+        // that absolutely has to be the real one.
+        let source = FakeSource::new(vec![
+            Some(-40), Some(-40), Some(-40),
+            Some(-100), Some(-100), Some(-100), Some(-100), Some(-100), Some(-100),
+        ]);
+        let locker = RecordingLocker::new();
+        let mut t = tracker();
+        let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
+        let grace_seconds = 10;
+        let tick = Duration::from_secs(2);
+
+        let mut status = None;
+        for _ in 0..9 {
+            status = Some(
+                run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await,
+            );
+        }
+        // Round 9 confirms the departure and contributes its own 2s tick.
+        assert_eq!(status.as_ref().unwrap().grace_remaining, Some(8));
+
+        let next = run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
+        assert_eq!(next.grace_remaining, Some(6), "the countdown must tick down with the poll loop");
+
+        for _ in 0..3 {
+            status = Some(
+                run_once(&source, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await,
+            );
+        }
+        assert_eq!(locker.calls(), 1, "fixture must actually reach the lock");
+        assert_eq!(
+            status.unwrap().grace_remaining,
+            None,
+            "once the lock has fired there is no countdown left to show"
+        );
+    }
+
+    #[tokio::test]
+    async fn never_seen_and_vanished_are_different_statuses() {
+        // Both read as Presence::Away, but "we have never found this phone"
+        // and "we saw it 6 seconds ago" are very different claims, and the
+        // popover makes exactly that distinction.
+        let locker = RecordingLocker::new();
+        let mut t = tracker();
+        let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
+        let tick = Duration::from_secs(2);
+
+        // Never seen: the peripheral has not advertised at all.
+        let absent = FakeSource::new(vec![None]); // FakeSource repeats the last value
+        let status = run_once(&absent, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", 10, tick).await;
+        assert_eq!(status.last_seen, None, "a phone that never appeared has no last-seen time");
+
+        // Seen once, then gone.
+        let present = FakeSource::new(vec![Some(-40)]);
+        let status = run_once(&present, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", 10, tick).await;
+        assert_eq!(status.last_seen, Some(0));
+
+        let mut status = None;
+        for _ in 0..3 {
+            status = Some(
+                run_once(&absent, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", 10, tick).await,
+            );
+        }
+        assert_eq!(status.unwrap().last_seen, Some(6), "staleness must accrue once the phone stops advertising");
+    }
+
+    #[tokio::test]
+    async fn a_sensor_fault_does_not_count_as_a_sighting() {
+        // The staleness clock must keep running through a fault. Freezing it
+        // would let the popover show a reassuringly recent "seen 2s ago"
+        // during exactly the window where we can see nothing at all.
+        let locker = RecordingLocker::new();
+        let mut t = tracker();
+        let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
+        let tick = Duration::from_secs(2);
+
+        let present = FakeSource::new(vec![Some(-40)]);
+        run_once(&present, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", 10, tick).await;
+
+        let broken = ErrorSource;
+        let status = run_once(&broken, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", 10, tick).await;
+        assert_eq!(status.last_seen, Some(2), "a fault is not a sighting");
+        assert!(status.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_countdown_needs_a_fresh_departure_to_start_another() {
+        // What "Cancel — I'm still here" does. It must dismiss exactly one
+        // pending lock: staying away afterwards must not silently restart
+        // the countdown, and it must not disarm either -- the next real
+        // Near -> Away departure still has to lock.
+        let depart = FakeSource::new(vec![
+            Some(-40), Some(-40), Some(-40),
+            Some(-100), Some(-100), Some(-100), Some(-100), Some(-100), Some(-100),
+        ]);
+        let locker = RecordingLocker::new();
+        let mut t = tracker();
+        let mut grace = GraceTimer::new();
+        let mut seen = Liveness::new();
+        let grace_seconds = 10;
+        let tick = Duration::from_secs(2);
+
+        for _ in 0..9 {
+            run_once(&depart, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
+        }
+        assert!(grace.is_pending(), "fixture must actually start a countdown");
+
+        // The user says they are still here.
+        grace.cancel();
+
+        // Staying away must not resurrect it, however many rounds pass.
+        let still_away = FakeSource::new(vec![Some(-100)]);
+        for _ in 0..20 {
+            run_once(&still_away, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
+        }
+        assert_eq!(t.state(), Presence::Away, "the phone really is still out of range");
+        assert_eq!(locker.calls(), 0, "a cancelled countdown must not restart on its own");
+
+        // But the guard is still up: come back, leave again, and it locks.
+        let back = FakeSource::new(vec![Some(-40)]);
+        for _ in 0..12 {
+            run_once(&back, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
+            if t.state() == Presence::Near {
+                break;
+            }
+        }
+        assert_eq!(t.state(), Presence::Near, "fixture must actually reconfirm Near");
+
+        let leave = FakeSource::new(vec![Some(-100)]);
+        for _ in 0..20 {
+            run_once(&leave, &mut t, &mut grace, &mut seen, &locker, true, "fake-device", grace_seconds, tick).await;
+        }
+        assert_eq!(locker.calls(), 1, "cancelling one lock must not disarm the next departure");
+    }
+
     #[test]
     fn grace_timer_starts_not_pending() {
         let g = GraceTimer::new();
         assert!(!g.is_pending());
+    }
+
+    #[test]
+    fn grace_timer_reports_no_remaining_time_when_nothing_is_pending() {
+        let g = GraceTimer::new();
+        assert_eq!(g.remaining(Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn grace_timer_remaining_saturates_instead_of_underflowing() {
+        // `advance` clears the timer the round it reaches `grace`, so an
+        // overrun is only reachable if the grace period is shortened under a
+        // countdown that is already past it. Report zero, not a wrapped
+        // enormous number that would render as "Locking in 18446744073s".
+        let mut g = GraceTimer::new();
+        g.start();
+        g.advance(Duration::from_secs(8), Duration::from_secs(30));
+        assert_eq!(g.remaining(Duration::from_secs(4)), Some(Duration::ZERO));
     }
 
     #[test]
