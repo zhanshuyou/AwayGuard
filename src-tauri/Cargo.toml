@@ -31,6 +31,13 @@ async-trait = "0.1.91"
 futures = "0.3.33"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
+# The popover has to opt into being shown on every Space, which needs an
+# AppKit call `tauri` does not wrap. Same versions `tao` already builds, so
+# these cost nothing extra to compile.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSResponder"] }
+
 [dev-dependencies]
 # Only needed to construct btleplug PeripheralIds in liveness unit tests.
 uuid = "1"

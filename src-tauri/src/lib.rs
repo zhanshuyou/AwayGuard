@@ -89,6 +89,62 @@ fn update_tray(
     }
 }
 
+/// Lets the popover follow the user from Space to Space instead of staying
+/// pinned to the one it was created on.
+///
+/// Without this the window keeps `NSWindowCollectionBehaviorDefault`. Everything
+/// then *looks* fine from the app's side -- `show()` succeeds, the window
+/// reports visible, key and fully opaque, and the app is frontmost -- while the
+/// user, standing on any other Space, sees nothing at all. A menu bar icon is
+/// reachable from every Space, so its panel has to be too.
+///
+/// `CanJoinAllSpaces` is what does the work, across desktops and across
+/// displays: with "Displays have separate Spaces" on (the macOS default) each
+/// screen keeps its own set, so a second monitor counts too.
+/// `FullScreenAuxiliary` rides along because it is free, but note that it
+/// governs living beside *this* app's own full-screen window and does not, on
+/// its own, grant entry to another app's full-screen Space -- see the note on
+/// the level below for what is still missing there.
+///
+/// `tauri`'s `set_visible_on_all_workspaces` sets only `CanJoinAllSpaces` and
+/// cannot touch the level at all, hence going through AppKit directly.
+#[cfg(target_os = "macos")]
+fn float_over_every_space(window: &WebviewWindow) -> Result<(), Box<dyn std::error::Error>> {
+    use objc2::rc::Retained;
+    use objc2_app_kit::{NSStatusWindowLevel, NSWindow, NSWindowCollectionBehavior};
+
+    let ptr = window.ns_window()?;
+    // SAFETY: `ns_window` hands back the window's live `NSWindow`, and the
+    // popover outlives setup. `retain` balances the release when `ns` drops.
+    let ns: Retained<NSWindow> =
+        unsafe { Retained::retain(ptr.cast()).ok_or("the popover has no backing NSWindow")? };
+    ns.setCollectionBehavior(
+        ns.collectionBehavior()
+            | NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+    // Where a menu bar panel belongs: `tao`'s `alwaysOnTop` only reaches the
+    // floating level, which clears ordinary windows but sits below anything
+    // else parked around the menu bar.
+    //
+    // This does NOT buy entry to another app's full-screen Space, which was
+    // the reason it went in -- measured and disproven, so it is recorded here
+    // rather than left as folklore for the next person to re-test. With
+    // `CanJoinAllSpaces | FullScreenAuxiliary` set and the level raised to 25,
+    // `isOnActiveSpace` still reports false over a full-screen app. The cause
+    // is upstream of any of these knobs: showing the panel calls `set_focus`,
+    // which activates the app, and activating is incompatible with staying on
+    // somebody else's full-screen Space. Fixing that means a non-activating
+    // `NSPanel` rather than the plain `NSWindow` tauri creates. See README.
+    ns.setLevel(NSStatusWindowLevel);
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn float_over_every_space(_window: &WebviewWindow) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
 /// Gap between the menu bar and the top of the popover, in logical points.
 const TRAY_GAP: f64 = 6.0;
 /// Breathing room kept between the popover and the edge of the display.
@@ -141,6 +197,7 @@ fn position_under_tray(window: &WebviewWindow, rect: Rect) {
 
     let mut x = icon_pos.x + icon_size.width / 2.0 - width / 2.0;
     let mut y = icon_pos.y + icon_size.height + TRAY_GAP * scale;
+
 
     if let Some(monitor) = monitor {
         let area = monitor.work_area();
@@ -269,6 +326,7 @@ pub fn run() {
                 let window = app
                     .get_webview_window("main")
                     .ok_or_else(|| std::io::Error::other("the \"main\" window is missing"))?;
+                float_over_every_space(&window)?;
                 let panel = window.clone();
                 let dismissed_at = dismissed_at.clone();
                 window.on_window_event(move |event| {
